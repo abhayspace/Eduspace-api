@@ -267,6 +267,43 @@ class Examination(BaseModel):
     max_marks: float = 100
 
 
+class ExaminationBatchIn(BaseModel):
+    name: str = Field(min_length=1)
+    term: Optional[str] = None
+    class_names: List[str] = Field(min_length=1)
+    subjects: List[str] = Field(min_length=1)
+    max_marks: float = 100
+
+
+class ExaminationBatchOut(BaseModel):
+    name: str
+    created: int
+    examinations: List[Examination] = Field(default_factory=list)
+
+
+class ExaminationGroupOut(BaseModel):
+    name: str
+    class_names: List[str] = Field(default_factory=list)
+    subjects: List[str] = Field(default_factory=list)
+    max_marks: float = 100
+
+
+class ExaminationGroupReplaceIn(ExaminationBatchIn):
+    original_name: str = Field(min_length=1)
+
+
+class DatesheetEntryIn(BaseModel):
+    examination_id: str
+    exam_date: str
+    max_marks: Optional[float] = None
+
+
+class DatesheetUpdateIn(BaseModel):
+    exam_name: str
+    class_name: Optional[str] = None
+    entries: List[DatesheetEntryIn] = Field(min_length=1)
+
+
 class ResultItem(BaseModel):
     id: str = Field(default_factory=_uuid)
     school_id: str = ""
@@ -274,6 +311,22 @@ class ResultItem(BaseModel):
     student_email: str
     marks_obtained: float = 0
     grade: Optional[str] = None
+
+
+class ResultBulkItemIn(BaseModel):
+    examination_id: str
+    student_email: str
+    marks_obtained: float
+    grade: Optional[str] = None
+
+
+class ResultBulkIn(BaseModel):
+    items: List[ResultBulkItemIn] = Field(min_length=1)
+
+
+class ResultBulkOut(BaseModel):
+    created: int
+    results: List[ResultItem] = Field(default_factory=list)
 
 
 class ChatMessage(BaseModel):
