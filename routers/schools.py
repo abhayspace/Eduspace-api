@@ -1,0 +1,607 @@
+"""School discovery + registration routes."""
+import logging
+import re
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
+
+from database import get_client
+from schemas.school import (
+    AdmissionLookupIn,
+    AdmissionLookupResult,
+    School,
+    SchoolProfileOut,
+    SchoolProfileUpdateIn,
+    SchoolRegisterIn,
+    SchoolRegisterOut,
+    SchoolSearchIn,
+    SchoolSearchResult,
+    VerifyCodeIn,
+)
+from services.otp_service import clear, is_verified
+from services.school_logo_service import resolve_school_logo
+from services.school_service import register_school
+from utils.deps import require_roles
+
+router = APIRouter(prefix="/schools", tags=["schools"])
+logger = logging.getLogger("eduspace.schools")
+
+_SCHOOL_COLUMNS = "id,school_name,institution_code,logo_url,is_active"
+_SEARCH_COLUMNS = (
+    "id,school_name,institution_code,logo_url,is_active,city,state,address,phone"
+)
+_PROFILE_COLUMNS = (
+    "id,school_name,institution_code,logo_url,address,city,state,pincode,"
+    "email,phone,board,established_date,school_type,level_of_education,total_students,total_teachers,"
+    "principal_name,website,gst_number,subscription_plan,admin_email,admin_mobile"
+)
+_PROFILE_COLUMNS_FALLBACK = (
+    "id,school_name,institution_code,logo_url,address,city,state,pincode,"
+    "email,phone,board,school_type,level_of_education,total_students,total_teachers,"
+    "principal_name,website,gst_number,subscription_plan"
+)
+_DEFAULT_LOGO_COLOR = "#2563EB"
+_EMAIL_OTP_PURPOSE = "school_profile_email"
+
+
+async def _fetch_school_profile_row(school_id: str) -> dict:
+    """Load school profile, tolerating missing optional columns until migrations apply."""
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select(_PROFILE_COLUMNS_FALLBACK)
+        .eq("id", school_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    row = dict(res.data[0])
+    for col in ("established_date", "admin_email", "admin_mobile"):
+        try:
+            extra = (
+                await client.table("schools")
+                .select(col)
+                .eq("id", school_id)
+                .limit(1)
+                .execute()
+            )
+            if extra.data:
+                row[col] = extra.data[0].get(col)
+        except Exception:
+            logger.warning("%s not available yet for school %s", col, school_id)
+    return row
+
+
+def _to_school(row: dict) -> School:
+    """Map a stored schools row to the frontend School shape."""
+    name = row.get("school_name") or row.get("name") or ""
+    short_name = name.split()[0][:20] if name else ""
+    return School(
+        id=row["id"],
+        name=name,
+        short_name=short_name,
+        logo_color=row.get("logo_color") or _DEFAULT_LOGO_COLOR,
+        institution_code=row.get("institution_code") or "",
+    )
+
+
+def _to_search_result(row: dict) -> SchoolSearchResult:
+    base = _to_school(row)
+    return SchoolSearchResult(
+        **base.model_dump(),
+        city=row.get("city"),
+        address=row.get("address"),
+        state=row.get("state"),
+        phone=row.get("phone"),
+    )
+
+
+def _resolve_admin_display_name(row: dict, admin_user: Optional[dict] = None) -> Optional[str]:
+    """Person name for Administration → Admin (never the school name)."""
+    school = (row.get("school_name") or "").strip().lower()
+
+    def usable(raw: Optional[str]) -> Optional[str]:
+        name = (raw or "").strip()
+        if not name:
+            return None
+        if school and name.lower() == school:
+            return None
+        return name
+
+    admin = admin_user or {}
+    # Registration stores administrator full name on schools.principal_name.
+    for candidate in (admin.get("full_name"), row.get("principal_name")):
+        name = usable(candidate)
+        if name:
+            return name
+    return None
+
+
+def _to_profile(row: dict, admin_user: Optional[dict] = None) -> SchoolProfileOut:
+    established = row.get("established_date")
+    if established is not None:
+        established = str(established)[:10]
+    admin = admin_user or {}
+    # Prefer school-stored admin contact (no separate ADM login). Fall back to legacy user row.
+    admin_email = row.get("admin_email") or admin.get("email")
+    admin_mobile = row.get("admin_mobile") or admin.get("mobile")
+    return SchoolProfileOut(
+        id=row.get("id"),
+        school_name=row.get("school_name") or "",
+        institution_code=row.get("institution_code") or "",
+        logo_url=row.get("logo_url"),
+        address=row.get("address"),
+        city=row.get("city"),
+        state=row.get("state"),
+        pincode=row.get("pincode"),
+        school_email=row.get("email"),
+        school_phone=row.get("phone"),
+        education_board=row.get("board"),
+        established_date=established,
+        school_type=row.get("school_type"),
+        level_of_education=row.get("level_of_education"),
+        total_students=row.get("total_students"),
+        total_teachers=row.get("total_teachers"),
+        principal_name=row.get("principal_name"),
+        admin_name=_resolve_admin_display_name(row, admin_user),
+        website=row.get("website"),
+        gst_number=row.get("gst_number"),
+        subscription_plan=row.get("subscription_plan"),
+        admin_email=admin_email,
+        admin_mobile=admin_mobile,
+    )
+
+
+async def _fetch_school_admin_user(school_id: str) -> Optional[dict]:
+    """Canonical School Management (SCH) account for admin name/contact."""
+    client = get_client()
+    sch = (
+        await client.table("users")
+        .select("id,email,full_name,mobile,role,user_code")
+        .eq("school_id", school_id)
+        .eq("role", "school_admin")
+        .like("user_code", "SCH%")
+        .eq("is_active", True)
+        .limit(1)
+        .execute()
+    )
+    if sch.data:
+        return sch.data[0]
+    fallback = (
+        await client.table("users")
+        .select("id,email,full_name,mobile,role,user_code")
+        .eq("school_id", school_id)
+        .eq("role", "school_admin")
+        .eq("is_active", True)
+        .limit(1)
+        .execute()
+    )
+    return fallback.data[0] if fallback.data else None
+
+
+def _digits_only(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
+def _phone_matches(school_phone: Optional[str], contact: str) -> bool:
+    contact_digits = _digits_only(contact)
+    if not contact_digits:
+        return False
+    raw = (school_phone or "").strip()
+    if not raw:
+        return False
+    for part in re.split(r"[,;\n]+", raw):
+        part_digits = _digits_only(part)
+        if not part_digits:
+            continue
+        if contact_digits == part_digits or contact_digits in part_digits or part_digits in contact_digits:
+            return True
+    return contact_digits in _digits_only(raw)
+
+
+def _name_matches(value: Optional[str], query: str) -> bool:
+    q = query.strip().lower()
+    if not q:
+        return True
+    if not value:
+        return False
+    return q in value.strip().lower()
+
+
+def _mobile_matches(stored: Optional[str], contact: str) -> bool:
+    contact_digits = _digits_only(contact)
+    if not contact_digits:
+        return False
+    stored_digits = _digits_only(stored or "")
+    if not stored_digits:
+        return False
+    if contact_digits == stored_digits:
+        return True
+    tail = 10
+    if len(contact_digits) >= tail and len(stored_digits) >= tail:
+        return contact_digits[-tail:] == stored_digits[-tail:]
+    return contact_digits in stored_digits or stored_digits in contact_digits
+
+
+def _admission_candidates(admission_no: str) -> list[str]:
+    ident = admission_no.strip()
+    if not ident:
+        return []
+    candidates = [ident]
+    if ident.isdigit():
+        n = int(ident)
+        candidates.extend([str(n), f"{n:04d}", f"{n:05d}"])
+    else:
+        candidates.append(ident.upper())
+    return list(dict.fromkeys(candidates))
+
+
+def _filter_by_location(
+    rows: list[dict],
+    name: str,
+    city: str,
+    state: str,
+) -> list[SchoolSearchResult]:
+    name_q = name.strip().lower()
+    city_q = city.strip().lower()
+    state_q = state.strip().lower()
+    results: list[SchoolSearchResult] = []
+    for row in rows:
+        school_name = (row.get("school_name") or "").lower()
+        if name_q and name_q not in school_name:
+            continue
+        if city_q and city_q not in (row.get("city") or "").lower():
+            continue
+        if state_q and state_q not in (row.get("state") or "").lower():
+            continue
+        results.append(_to_search_result(row))
+    return results
+
+
+async def _school_ids_by_admission(admission_no: str) -> set[str]:
+    client = get_client()
+    school_ids: set[str] = set()
+    for candidate in _admission_candidates(admission_no):
+        res = (
+            await client.table("users")
+            .select("school_id")
+            .eq("role", "student")
+            .eq("admission_no", candidate)
+            .eq("is_active", True)
+            .execute()
+        )
+        for row in res.data or []:
+            sid = row.get("school_id")
+            if sid:
+                school_ids.add(sid)
+    return school_ids
+
+
+async def _search_by_admission_and_contact(
+    rows: list[dict],
+    admission_no: str,
+    contact: str,
+) -> list[SchoolSearchResult]:
+    admission_ids = await _school_ids_by_admission(admission_no)
+    if not admission_ids:
+        return []
+    results: list[SchoolSearchResult] = []
+    for row in rows:
+        if row.get("id") not in admission_ids:
+            continue
+        if not _phone_matches(row.get("phone"), contact):
+            continue
+        results.append(_to_search_result(row))
+    return results
+
+
+async def _load_active_schools() -> list[dict]:
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select(_SEARCH_COLUMNS)
+        .eq("is_active", True)
+        .order("school_name")
+        .limit(500)
+        .execute()
+    )
+    return res.data or []
+
+
+async def search_schools(body: SchoolSearchIn) -> list[SchoolSearchResult]:
+    """Step 1: school name + city + state. Step 2: admission number + contact."""
+    name = (body.school_name or "").strip()
+    city = (body.city or "").strip()
+    state = (body.state or "").strip()
+    admission_no = (body.admission_no or "").strip()
+    contact = (body.contact or "").strip()
+
+    rows = await _load_active_schools()
+
+    has_location = bool(name and city and state)
+    has_student_lookup = bool(admission_no and contact)
+
+    if has_location:
+        location_results = _filter_by_location(rows, name, city, state)
+        if location_results:
+            return location_results
+
+    if has_student_lookup:
+        return await _search_by_admission_and_contact(rows, admission_no, contact)
+
+    return []
+
+
+async def _resolve_school_id_by_code(institution_code: str) -> str:
+    client = get_client()
+    code = institution_code.strip().upper()
+    res = (
+        await client.table("schools")
+        .select("id")
+        .eq("institution_code", code)
+        .eq("is_active", True)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invalid institution code")
+    return res.data[0]["id"]
+
+
+async def lookup_student_admission(body: AdmissionLookupIn) -> List[AdmissionLookupResult]:
+    """Find a student's admission number within a school."""
+    name_q = (body.student_name or "").strip()
+    father_q = (body.father_name or "").strip()
+    mother_q = (body.mother_name or "").strip()
+    contact_q = (body.contact or "").strip()
+
+    if not any([name_q, father_q, mother_q, contact_q]):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Enter at least one of student name, father name, mother name, or contact number.",
+        )
+
+    school_id = await _resolve_school_id_by_code(body.institution_code)
+    client = get_client()
+    students_res = (
+        await client.table("students")
+        .select("user_id,father_name,mother_name,guardian_mobile,alternate_mobile,admission_no")
+        .eq("school_id", school_id)
+        .limit(1000)
+        .execute()
+    )
+    profiles = students_res.data or []
+    if not profiles:
+        return []
+
+    user_ids = [p["user_id"] for p in profiles if p.get("user_id")]
+    users_res = (
+        await client.table("users")
+        .select("id,full_name,mobile,admission_no,is_active")
+        .in_("id", user_ids)
+        .eq("is_active", True)
+        .execute()
+    )
+    users_map = {u["id"]: u for u in (users_res.data or [])}
+
+    results: list[AdmissionLookupResult] = []
+    for profile in profiles:
+        user = users_map.get(profile.get("user_id"))
+        if not user:
+            continue
+
+        full_name = user.get("full_name") or ""
+        father_name = profile.get("father_name")
+        mother_name = profile.get("mother_name")
+        guardian_mobile = profile.get("guardian_mobile")
+        alternate_mobile = profile.get("alternate_mobile")
+        user_mobile = user.get("mobile")
+
+        if not _name_matches(full_name, name_q):
+            continue
+        if not _name_matches(father_name, father_q):
+            continue
+        if not _name_matches(mother_name, mother_q):
+            continue
+        if contact_q and not any(
+            _mobile_matches(v, contact_q) for v in (guardian_mobile, alternate_mobile, user_mobile)
+        ):
+            continue
+
+        admission_no = (user.get("admission_no") or profile.get("admission_no") or "").strip()
+        if not admission_no:
+            continue
+
+        results.append(
+            AdmissionLookupResult(
+                full_name=full_name,
+                father_name=father_name,
+                mother_name=mother_name,
+                admission_no=admission_no,
+            )
+        )
+
+    results.sort(key=lambda r: r.full_name.lower())
+    return results[:25]
+
+
+@router.get("/me", response_model=SchoolProfileOut)
+async def get_my_school_profile(
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
+) -> SchoolProfileOut:
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    row = await _fetch_school_profile_row(school_id)
+    admin_user = await _fetch_school_admin_user(school_id)
+    return _to_profile(row, admin_user or user)
+
+
+@router.get("/{school_id}/logo/{filename}")
+async def get_school_logo(school_id: str, filename: str):
+    path, content_type = resolve_school_logo(school_id, filename)
+    return FileResponse(path, media_type=content_type)
+
+
+@router.put("/me", response_model=SchoolProfileOut)
+async def update_my_school_profile(
+    body: SchoolProfileUpdateIn,
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
+) -> SchoolProfileOut:
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+
+    client = get_client()
+    current = await _fetch_school_profile_row(school_id)
+
+    updates: dict = {}
+    if body.education_board is not None:
+        updates["board"] = body.education_board.strip() or None
+    if body.established_date is not None:
+        value = body.established_date.strip()
+        updates["established_date"] = value or None
+    if body.school_phone is not None:
+        updates["phone"] = body.school_phone.strip() or None
+    if body.address is not None:
+        updates["address"] = body.address.strip() or None
+    if body.city is not None:
+        updates["city"] = body.city.strip() or None
+    if body.state is not None:
+        updates["state"] = body.state.strip() or None
+    if body.website is not None:
+        updates["website"] = body.website.strip() or None
+
+    current_email = (current.get("email") or "").strip().lower()
+    next_email = (str(body.school_email).strip().lower() if body.school_email is not None else current_email)
+
+    if body.school_email is not None and next_email != current_email:
+        if not current_email:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Current school email is missing. Contact support before changing email.",
+            )
+        if not is_verified(current_email, purpose=_EMAIL_OTP_PURPOSE):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Verify your current school email with OTP before changing it.",
+            )
+        if not is_verified(next_email, purpose=_EMAIL_OTP_PURPOSE):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Verify the new school email with OTP before saving.",
+            )
+        taken = (
+            await client.table("users")
+            .select("id")
+            .eq("email", next_email)
+            .limit(1)
+            .execute()
+        )
+        if taken.data:
+            raise HTTPException(status.HTTP_409_CONFLICT, "New school email is already registered")
+        school_email_taken = (
+            await client.table("schools")
+            .select("id")
+            .eq("email", next_email)
+            .neq("id", school_id)
+            .limit(1)
+            .execute()
+        )
+        if school_email_taken.data:
+            raise HTTPException(status.HTTP_409_CONFLICT, "New school email is already registered")
+        updates["email"] = next_email
+
+    if not updates:
+        admin_user = await _fetch_school_admin_user(school_id)
+        return _to_profile(current, admin_user or user)
+
+    try:
+        updated = (
+            await client.table("schools")
+            .update(updates)
+            .eq("id", school_id)
+            .execute()
+        )
+    except Exception:
+        if "established_date" in updates:
+            updates.pop("established_date", None)
+            if not updates:
+                admin_user = await _fetch_school_admin_user(school_id)
+                return _to_profile(current, admin_user or user)
+            updated = (
+                await client.table("schools")
+                .update(updates)
+                .eq("id", school_id)
+                .execute()
+            )
+        else:
+            raise
+    if not updated.data:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to update school profile")
+
+    if "email" in updates and current_email:
+        await (
+            client.table("users")
+            .update({"email": next_email})
+            .eq("school_id", school_id)
+            .eq("email", current_email)
+            .execute()
+        )
+        clear(current_email, purpose=_EMAIL_OTP_PURPOSE)
+        clear(next_email, purpose=_EMAIL_OTP_PURPOSE)
+
+    admin_user = await _fetch_school_admin_user(school_id)
+    return _to_profile(updated.data[0], admin_user or user)
+
+
+@router.get("", response_model=List[School])
+async def list_schools() -> List[School]:
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select(_SCHOOL_COLUMNS)
+        .eq("is_active", True)
+        .order("school_name")
+        .limit(200)
+        .execute()
+    )
+    return [_to_school(row) for row in (res.data or [])]
+
+
+@router.post("/search", response_model=List[SchoolSearchResult])
+async def search_schools_route(body: SchoolSearchIn) -> List[SchoolSearchResult]:
+    return await search_schools(body)
+
+
+@router.post("/lookup-admission", response_model=List[AdmissionLookupResult])
+async def lookup_admission_route(body: AdmissionLookupIn) -> List[AdmissionLookupResult]:
+    return await lookup_student_admission(body)
+
+
+@router.post("/verify", response_model=School)
+async def verify_institution_code(body: VerifyCodeIn) -> School:
+    code = body.code.strip().upper()
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select(_SCHOOL_COLUMNS)
+        .eq("institution_code", code)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Invalid institution code")
+    return _to_school(res.data[0])
+
+
+@router.post("/register", response_model=SchoolRegisterOut, status_code=status.HTTP_201_CREATED)
+async def register_school_route(body: SchoolRegisterIn) -> SchoolRegisterOut:
+    result = await register_school(body)
+    return SchoolRegisterOut(
+        message="School registered successfully. Login credentials have been sent to the school email.",
+        school_id=result.get("school_id"),
+        institution_code=result.get("institution_code"),
+    )

@@ -54,6 +54,11 @@ class AnnouncementAttachmentOut(BaseModel):
     attachment_name: str
 
 
+class HomeworkAttachmentOut(BaseModel):
+    attachment_url: str
+    attachment_name: str
+
+
 class HomeworkItem(BaseModel):
     id: str = Field(default_factory=_uuid)
     school_id: str = ""
@@ -61,8 +66,12 @@ class HomeworkItem(BaseModel):
     title: str
     description: str = ""
     class_name: str
+    section_name: str = ""
     due_date: str
     assigned_by: str = ""
+    assigned_by_user_id: Optional[str] = None
+    attachment_url: Optional[str] = None
+    attachment_name: Optional[str] = None
     created_at: datetime = Field(default_factory=_now)
 
 
@@ -336,6 +345,7 @@ class ChatMessage(BaseModel):
     sender_name: str
     sender_role: str
     recipient_id: Optional[str] = None
+    group_id: Optional[str] = None
     text: str = ""
     media_url: Optional[str] = None
     media_type: Optional[str] = None

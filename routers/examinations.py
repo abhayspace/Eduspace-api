@@ -20,6 +20,7 @@ from utils.deps import current_user, require_roles
 router = APIRouter(prefix="/examinations", tags=["examinations"])
 
 _COLUMNS = "id,school_id,name,term,class_name,subject,exam_date,max_marks"
+_SETUP_ROLES = ("school_admin", "principal", "vice_principal", "super_admin")
 
 
 @router.get("", response_model=List[Examination])
@@ -95,7 +96,7 @@ async def list_examination_groups(user: dict = Depends(current_user)) -> List[Ex
 @router.post("", response_model=Examination)
 async def create_examination(
     body: Examination,
-    user: dict = Depends(require_roles("school_admin", "principal", "teacher")),
+    user: dict = Depends(require_roles(*_SETUP_ROLES)),
 ) -> Examination:
     client = get_client()
     row = {
@@ -116,7 +117,7 @@ async def create_examination(
 @router.post("/batch", response_model=ExaminationBatchOut)
 async def create_examination_batch(
     body: ExaminationBatchIn,
-    user: dict = Depends(require_roles("school_admin", "principal", "teacher")),
+    user: dict = Depends(require_roles(*_SETUP_ROLES)),
 ) -> ExaminationBatchOut:
     client = get_client()
     school_id = user["school_id"]
@@ -145,7 +146,7 @@ async def create_examination_batch(
 @router.put("/group", response_model=ExaminationBatchOut)
 async def replace_examination_group(
     body: ExaminationGroupReplaceIn,
-    user: dict = Depends(require_roles("school_admin", "principal", "teacher")),
+    user: dict = Depends(require_roles(*_SETUP_ROLES)),
 ) -> ExaminationBatchOut:
     client = get_client()
     school_id = user["school_id"]
@@ -203,7 +204,7 @@ async def replace_examination_group(
 @router.delete("/group", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_examination_group(
     name: str = Query(...),
-    user: dict = Depends(require_roles("school_admin", "principal", "teacher")),
+    user: dict = Depends(require_roles(*_SETUP_ROLES)),
 ) -> Response:
     client = get_client()
     existing = (
@@ -229,7 +230,7 @@ async def delete_examination_group(
 @router.put("/datesheet", response_model=List[Examination])
 async def update_datesheet(
     body: DatesheetUpdateIn,
-    user: dict = Depends(require_roles("school_admin", "principal", "teacher")),
+    user: dict = Depends(require_roles(*_SETUP_ROLES)),
 ) -> List[Examination]:
     client = get_client()
     school_id = user["school_id"]
