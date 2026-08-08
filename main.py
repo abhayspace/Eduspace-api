@@ -14,18 +14,26 @@ from starlette.middleware.cors import CORSMiddleware
 
 from config import get_settings
 from database import close_supabase, init_supabase
+from middleware.profiling import ProfilingMiddleware
 from routers import (
     academic,
+    achievements,
     announcements,
+    appointments,
+    school_medical,
     attendance,
     auth,
     calendar,
+    dev_message,
+    eddy,
     examinations,
     expenses,
     fees,
     forgot,
     gallery,
     homework,
+    leave_requests,
+    library,
     messages,
     misc,
     notifications,
@@ -38,7 +46,9 @@ from routers import (
     schools,
     staff,
     students,
+    student_settings,
     support,
+    syllabus,
     teachers,
     timetable,
 )
@@ -79,6 +89,8 @@ ROUTERS = [
     otp.router,
     schools.router,
     support.router,
+    dev_message.router,
+    student_settings.router,
     students.router,
     teachers.router,
     staff.router,
@@ -95,10 +107,17 @@ ROUTERS = [
     receipts.router,
     expenses.router,
     gallery.router,
+    leave_requests.router,
+    appointments.router,
+    school_medical.router,
+    library.router,
+    syllabus.router,
     examinations.router,
     results.router,
+    achievements.router,
     notifications.router,
     messages.router,
+    eddy.router,
 ]
 for r in ROUTERS:
     app.include_router(r, prefix="/api")
@@ -129,3 +148,5 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(ProfilingMiddleware)
