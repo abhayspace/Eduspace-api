@@ -429,6 +429,15 @@ async def _assert_group_access(school_id: str, group_id: str, user: dict) -> Non
 
 async def _group_member_user_ids(school_id: str, group_id: str) -> List[str]:
     """Best-effort member ids for notifications (auto class groups only)."""
+    if group_id == "group:auto:teachers":
+        client = get_client()
+        teachers = (
+            await client.table("teachers")
+            .select("user_id")
+            .eq("school_id", school_id)
+            .execute()
+        )
+        return [row["user_id"] for row in (teachers.data or []) if row.get("user_id")]
     parsed = _parse_auto_group(group_id)
     if not parsed:
         return []
@@ -1105,6 +1114,8 @@ async def list_chat_threads(user: dict = Depends(current_user)) -> List[ChatThre
 
 
 async def _group_thread_name(school_id: str, group_id: str) -> str:
+    if group_id == "group:auto:teachers":
+        return "Teachers"
     parsed = _parse_auto_group(group_id)
     if not parsed:
         return "Group"
