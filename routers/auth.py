@@ -9,7 +9,7 @@ from schemas.common import LOGIN_ROLES, ROLES
 from schemas.forgot import LinkEmailIn
 from services import teacher_service
 from routers.forgot import is_gmail
-from utils.deps import current_user
+from utils.deps import current_user, current_user_allow_expired
 from utils.security import create_access_token, hash_password, verify_password
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -74,6 +74,28 @@ async def _to_public_enriched(user: dict) -> UserPublic:
     if user.get("role") == "teacher":
         info = await teacher_service.get_user_class_teacher_info(user["school_id"], user["id"])
         updates.update(info)
+    # Check trial status
+    school_id = user.get("school_id")
+    if school_id:
+        client = get_client()
+        try:
+            school_res = (
+                await client.table("schools")
+                .select("is_trial,trial_status,trial_ends_at")
+                .eq("id", school_id)
+                .limit(1)
+                .execute()
+            )
+            if school_res.data:
+                school_row = school_res.data[0]
+                is_trial = school_row.get("is_trial", False)
+                trial_status = school_row.get("trial_status")
+                updates["is_trial"] = is_trial
+                updates["trial_status"] = trial_status
+                # Only show trial_expired blocking screen for school_admin
+                updates["trial_expired"] = is_trial and trial_status == "expired" and user.get("role") == "school_admin"
+        except Exception:
+            pass
     return base.model_copy(update=updates) if updates else base
 
 
@@ -148,7 +170,31 @@ async def login(body: LoginIn) -> TokenOut:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
 
     if not user.get("is_active", True):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Inactive user")
+        # Check if inactive due to expired trial
+        school_id = user.get("school_id")
+        if school_id:
+            client = get_client()
+            try:
+                school_res = (
+                    await client.table("schools")
+                    .select("is_trial,trial_status")
+                    .eq("id", school_id)
+                    .limit(1)
+                    .execute()
+                )
+                if school_res.data and school_res.data[0].get("is_trial") and school_res.data[0].get("trial_status") == "expired":
+                    # Teachers should remain active even after trial expiry
+                    if user.get("role") == "teacher":
+                        await client.table("users").update({"is_active": True}).eq("id", user["id"]).execute()
+                        user["is_active"] = True
+                    else:
+                        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your free trial has expired. Please register or stop to continue.")
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+        if not user.get("is_active", True):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Inactive user")
     if body.school_id and user.get("school_id") != body.school_id:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User does not belong to selected school")
     if body.role and not is_school_portal_login and user.get("role") != body.role:
@@ -203,6 +249,19 @@ async def register(body: RegisterIn) -> UserPublic:
 @router.get("/me", response_model=UserPublic)
 async def me(user: dict = Depends(current_user)) -> UserPublic:
     return await _to_public_enriched(user)
+
+
+@router.post("/refresh", response_model=TokenOut)
+async def refresh_token(user: dict = Depends(current_user_allow_expired)) -> TokenOut:
+    """Issue a fresh token for an authenticated user (extends session).
+
+    Accepts expired tokens — signature is still verified, and the user must
+    still exist and be active. This prevents next-day logouts.
+    """
+    token = create_access_token(
+        user_id=user["id"], role=user["role"], email=user["email"], school_id=user["school_id"]
+    )
+    return TokenOut(access_token=token, user=await _to_public_enriched(user))
 
 
 @router.post("/change-password")

@@ -1,13 +1,20 @@
 """Non-teaching staff and admin role management."""
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, status
 
-from schemas.people import AdminRoleCreateIn, AdminRoleOut, StaffCreateIn, StaffCreateOut, CredentialsOut
+from schemas.people import AdminRoleCreateIn, AdminRoleOut, StaffCreateIn, StaffCreateOut, StaffOut, CredentialsOut
 from services import staff_service
 from utils.deps import require_roles
 
 router = APIRouter(prefix="/staff", tags=["staff"])
+
+
+@router.get("", response_model=List[StaffOut])
+async def list_staff(
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
+) -> List[StaffOut]:
+    return await staff_service.list_staff(user["school_id"])
 
 
 @router.post("", response_model=StaffCreateOut, status_code=status.HTTP_201_CREATED)

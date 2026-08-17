@@ -22,6 +22,10 @@ class UserPublic(BaseModel):
     class_teacher_section_name: Optional[str] = None
     # School Management: SCH + legacy ADM share one inbox across devices.
     message_actor_ids: Optional[List[str]] = None
+    # Trial school flags
+    is_trial: bool = False
+    trial_expired: bool = False
+    trial_status: Optional[str] = None
 
 
 class LoginIn(BaseModel):

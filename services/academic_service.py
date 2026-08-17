@@ -9,9 +9,19 @@ from schemas.people import ClassOut, ClassSectionOut, SectionOut, SubjectOut, Te
 from services import teacher_service
 
 DEFAULT_SUBJECTS = [
-    "Math", "Science", "Physics", "Chemistry", "Biology",
-    "English", "Hindi", "Computer", "History", "Geography",
-    "Economics", "Political Science", "Sanskrit", "Art", "Physical Education",
+    "English", "Hindi", "Mathematics", "Science", "Social Science",
+    "Environmental Studies (EVS)", "Computer Science", "General Knowledge (GK)",
+    "General Studies", "Physics", "Chemistry", "Biology", "Biotechnology",
+    "Informatics Practices", "Physical Education", "Accountancy",
+    "Business Studies", "Economics", "Entrepreneurship", "Applied Mathematics",
+    "Financial Studies", "History", "Geography", "Political Science",
+    "Sociology", "Psychology", "Philosophy", "Legal Studies", "Home Science",
+    "Artificial Intelligence", "Information Technology", "Data Science",
+    "Web Development", "Robotics", "Coding / Programming", "Digital Literacy",
+    "Multimedia & Animation", "Vocational Studies", "Sanskrit", "Punjabi",
+    "Urdu", "French", "German", "Spanish", "Art & Craft", "Music", "Dance",
+    "Drama", "Health & Wellness", "Moral Education", "Value Education",
+    "Life Skills", "Work Education", "Library", "General Awareness",
 ]
 
 
@@ -106,16 +116,16 @@ async def _find_class_by_name(school_id: str, name: str) -> Optional[dict]:
             client.table("classes")
             .select("id,name,grade_level")
             .eq("school_id", school_id)
+            .ilike("name", name.strip())
+            .limit(1)
             .execute()
         )
     except APIError as exc:
         _raise_if_missing_table(exc, "classes")
         return None
 
-    needle = _class_name_key(name)
-    for row in res.data or []:
-        if _class_name_key(row.get("name") or "") == needle:
-            return row
+    if res.data:
+        return res.data[0]
     return None
 
 
@@ -154,13 +164,26 @@ async def _class_out_for_id(school_id: str, class_id: str) -> ClassOut:
 
 
 async def ensure_defaults(school_id: str) -> None:
-    """Seed default subjects for this school if none exist."""
+    """Seed default subjects for this school, adding any missing defaults.
+
+    Throttled to at most once per 60 seconds per school to avoid
+    running a redundant SELECT on every list_classes/sections/subjects call.
+    """
+    from utils.ttl_cache import should_run
+
+    if not should_run(f"ensure_defaults:{school_id}", ttl_seconds=60):
+        return
     client = get_client()
     try:
-        subj = await client.table("subjects").select("id").eq("school_id", school_id).limit(1).execute()
-        if not subj.data:
-            rows = [{"school_id": school_id, "name": n, "code": n[:3].upper()} for n in DEFAULT_SUBJECTS]
-            await client.table("subjects").insert(rows).execute()
+        existing = await client.table("subjects").select("name").eq("school_id", school_id).execute()
+        existing_names = {row["name"].lower() for row in (existing.data or [])}
+        to_add = [
+            {"school_id": school_id, "name": n, "code": n[:3].upper()}
+            for n in DEFAULT_SUBJECTS
+            if n.lower() not in existing_names
+        ]
+        if to_add:
+            await client.table("subjects").insert(to_add).execute()
     except APIError as exc:
         table = "subjects"
         if "classes" in str(exc):
@@ -293,6 +316,21 @@ async def list_subjects(school_id: str) -> List[SubjectOut]:
     except APIError as exc:
         _raise_if_missing_table(exc, "subjects")
     return [SubjectOut(**row) for row in (res.data or [])]
+
+
+async def create_subject(school_id: str, name: str) -> SubjectOut:
+    client = get_client()
+    clean = name.strip()
+    if not clean:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Subject name is required")
+    existing = await client.table("subjects").select("id,name,code").eq("school_id", school_id).ilike("name", clean).execute()
+    if existing.data:
+        return SubjectOut(**existing.data[0])
+    row = {"school_id": school_id, "name": clean, "code": clean[:3].upper()}
+    inserted = await client.table("subjects").insert(row).execute()
+    if not inserted.data:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create subject")
+    return SubjectOut(**inserted.data[0])
 
 
 async def delete_class(school_id: str, class_id: str) -> None:

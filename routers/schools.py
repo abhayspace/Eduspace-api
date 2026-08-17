@@ -3,7 +3,7 @@ import logging
 import re
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
 from database import get_client
@@ -11,18 +11,29 @@ from schemas.school import (
     AdmissionLookupIn,
     AdmissionLookupResult,
     School,
+    SchoolBrandOut,
     SchoolProfileOut,
     SchoolProfileUpdateIn,
     SchoolRegisterIn,
     SchoolRegisterOut,
     SchoolSearchIn,
     SchoolSearchResult,
+    TrialRegisterIn,
+    TrialRegisterOut,
+    TrialStatusOut,
     VerifyCodeIn,
 )
 from services.otp_service import clear, is_verified
-from services.school_logo_service import resolve_school_logo
+from services.school_logo_service import resolve_school_logo, save_school_logo_bytes
 from services.school_service import register_school
-from utils.deps import require_roles
+from services.trial_service import (
+    check_and_expire_trials,
+    convert_trial_to_permanent,
+    get_trial_status,
+    register_trial_school,
+    stop_trial_and_delete,
+)
+from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/schools", tags=["schools"])
 logger = logging.getLogger("eduspace.schools")
@@ -427,6 +438,33 @@ async def lookup_student_admission(body: AdmissionLookupIn) -> List[AdmissionLoo
     return results[:25]
 
 
+@router.get("/brand", response_model=SchoolBrandOut)
+async def get_my_school_brand(user: dict = Depends(current_user)) -> SchoolBrandOut:
+    """School name/logo/contact for ID cards and headers — any school member can read."""
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select("school_name,logo_url,email,phone,address,city")
+        .eq("id", school_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    row = res.data[0]
+    return SchoolBrandOut(
+        school_name=(row.get("school_name") or "").strip(),
+        logo_url=row.get("logo_url"),
+        school_email=row.get("email"),
+        school_phone=row.get("phone"),
+        address=row.get("address"),
+        city=row.get("city"),
+    )
+
+
 @router.get("/me", response_model=SchoolProfileOut)
 async def get_my_school_profile(
     user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
@@ -443,6 +481,36 @@ async def get_my_school_profile(
 async def get_school_logo(school_id: str, filename: str):
     path, content_type = resolve_school_logo(school_id, filename)
     return FileResponse(path, media_type=content_type)
+
+
+@router.post("/me/logo")
+async def upload_my_school_logo(
+    file: UploadFile = File(...),
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
+) -> dict:
+    """Upload or replace the current school's logo."""
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+
+    content = await file.read()
+    logo_url = save_school_logo_bytes(
+        school_id,
+        content,
+        filename=file.filename,
+        content_type=file.content_type,
+    )
+
+    client = get_client()
+    updated = (
+        await client.table("schools")
+        .update({"logo_url": logo_url})
+        .eq("id", school_id)
+        .execute()
+    )
+    if not updated.data:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to save school logo")
+    return {"logo_url": logo_url}
 
 
 @router.put("/me", response_model=SchoolProfileOut)
@@ -605,3 +673,45 @@ async def register_school_route(body: SchoolRegisterIn) -> SchoolRegisterOut:
         school_id=result.get("school_id"),
         institution_code=result.get("institution_code"),
     )
+
+
+@router.post("/trial-register", response_model=TrialRegisterOut, status_code=status.HTTP_201_CREATED)
+async def trial_register_route(body: TrialRegisterIn) -> TrialRegisterOut:
+    result = await register_trial_school(body)
+    return TrialRegisterOut(
+        message="Free trial activated! Login credentials have been sent to your school email. The trial is valid for 7 days.",
+        institution_code=result.get("institution_code"),
+    )
+
+
+@router.get("/trial-status", response_model=TrialStatusOut)
+async def trial_status_route(user: dict = Depends(current_user)) -> TrialStatusOut:
+    school_id = user.get("school_id")
+    if not school_id:
+        return TrialStatusOut(is_trial=False)
+    status = await get_trial_status(school_id)
+    return TrialStatusOut(**status)
+
+
+@router.post("/trial-convert")
+async def trial_convert_route(user: dict = Depends(require_roles("school_admin"))) -> dict:
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    result = await convert_trial_to_permanent(school_id)
+    return result
+
+
+@router.post("/trial-stop")
+async def trial_stop_route(user: dict = Depends(require_roles("school_admin"))) -> dict:
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    result = await stop_trial_and_delete(school_id)
+    return result
+
+
+@router.post("/trial-check-expired")
+async def trial_check_expired_route() -> dict:
+    count = await check_and_expire_trials()
+    return {"expired_count": count}

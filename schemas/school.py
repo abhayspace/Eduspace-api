@@ -102,6 +102,19 @@ class SchoolRegisterOut(BaseModel):
     institution_code: Optional[str] = None
 
 
+class SchoolBrandOut(BaseModel):
+    """Public school branding available to any authenticated member of the school."""
+
+    school_name: str = Field(alias="schoolName")
+    logo_url: Optional[str] = Field(default=None, alias="logoUrl")
+    school_email: Optional[str] = Field(default=None, alias="schoolEmail")
+    school_phone: Optional[str] = Field(default=None, alias="schoolPhone")
+    address: Optional[str] = None
+    city: Optional[str] = None
+
+    model_config = {"populate_by_name": True}
+
+
 class SchoolProfileOut(BaseModel):
     id: Optional[str] = None
     school_name: str = Field(alias="schoolName")
@@ -141,5 +154,31 @@ class SchoolProfileUpdateIn(BaseModel):
     city: Optional[str] = None
     state: Optional[str] = None
     website: Optional[str] = None
+
+    model_config = {"populate_by_name": True}
+
+
+class TrialRegisterIn(BaseModel):
+    """Payload for free trial school registration."""
+    school_name: str = Field(min_length=2, alias="schoolName")
+    admin_name: str = Field(min_length=2, alias="adminName")
+    school_email: EmailStr = Field(alias="schoolEmail")
+    phone: str = Field(min_length=6, alias="phone")
+
+    model_config = {"populate_by_name": True}
+
+
+class TrialRegisterOut(BaseModel):
+    success: bool = True
+    message: str
+    institution_code: Optional[str] = None
+
+
+class TrialStatusOut(BaseModel):
+    is_trial: bool = Field(alias="isTrial")
+    trial_status: Optional[str] = Field(default=None, alias="trialStatus")
+    trial_ends_at: Optional[str] = Field(default=None, alias="trialEndsAt")
+    school_name: Optional[str] = Field(default=None, alias="schoolName")
+    institution_code: Optional[str] = Field(default=None, alias="institutionCode")
 
     model_config = {"populate_by_name": True}

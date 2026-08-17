@@ -80,14 +80,14 @@ def _admission_match_clauses(ident: str) -> list[str]:
 def _otp_email_body(otp: str, full_name: str) -> str:
     name = full_name.strip() or "there"
     return (
-        f"EduSpace – Password Reset Code\n"
+        f"Eduspace – Password Reset Code\n"
         f"{'=' * 36}\n\n"
         f"Hi {name},\n\n"
         f"Your one-time password reset code is:\n\n"
         f"    {otp}\n\n"
         f"This code expires in 10 minutes.\n\n"
         f"If you did not request a password reset, you can ignore this email.\n\n"
-        f"— The EduSpace Team\n"
+        f"— The Eduspace Team\n"
     )
 
 
@@ -174,7 +174,7 @@ async def _send_forgot_otp(user: dict) -> StudentForgotSendOut:
     otp = generate_and_store(email, purpose=_OTP_PURPOSE)
     sent = await send_email(
         email,
-        "EduSpace – Password Reset Code",
+        "Eduspace – Password Reset Code",
         _otp_email_body(otp, user.get("full_name") or ""),
     )
     if not sent:

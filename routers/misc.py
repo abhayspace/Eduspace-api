@@ -136,11 +136,12 @@ async def _count_staff(school_id: str) -> int:
     return res.count if res.count is not None else 0
 
 
-async def _attendance_pct_today(school_id: str, table: str) -> dict:
+async def _attendance_pct_today(school_id: str, table: str, *, total: int | None = None) -> dict:
     today = date.today().isoformat()
     client = get_client()
     if table == "attendance":
-        total = await _count_students(school_id)
+        if total is None:
+            total = await _count_students(school_id)
         res = (
             await client.table("attendance")
             .select("*", count="exact", head=True)
@@ -151,7 +152,8 @@ async def _attendance_pct_today(school_id: str, table: str) -> dict:
         )
         present = res.count if res.count is not None else 0
     else:
-        total = await _count_staff(school_id)
+        if total is None:
+            total = await _count_staff(school_id)
         res = (
             await client.table("staff_attendance")
             .select("*", count="exact", head=True)
@@ -211,24 +213,27 @@ async def _expenses_report(
 ) -> dict:
     start, end, label = _period_bounds(period, month, year)
     client = get_client()
+    start_str = start.isoformat()
+    end_str = end.isoformat()
 
-    payments_res = (
-        await client.table("payments")
+    # Fetch all 3 data sources in parallel with date filters to reduce payload
+    payments_res, fees_res, tx_res = await asyncio.gather(
+        client.table("payments")
         .select("amount, paid_at")
         .eq("school_id", school_id)
-        .execute()
-    )
-    fees_res = (
-        await client.table("fees")
+        .gte("paid_at", f"{start_str}T00:00:00")
+        .lte("paid_at", f"{end_str}T23:59:59")
+        .execute(),
+        client.table("fees")
         .select("amount, status, paid_at, due_date, created_at")
         .eq("school_id", school_id)
-        .execute()
-    )
-    tx_res = (
-        await client.table("expense_transactions")
+        .execute(),
+        client.table("expense_transactions")
         .select("amount, type, transaction_date")
         .eq("school_id", school_id)
-        .execute()
+        .gte("transaction_date", start_str)
+        .lte("transaction_date", end_str)
+        .execute(),
     )
 
     income = 0.0
@@ -245,8 +250,7 @@ async def _expenses_report(
             continue
         if row.get("status") == "paid":
             income += amount
-        else:
-            expenses += amount
+        # Unpaid fees are not counted as spending — only actual expenses below.
 
     for row in tx_res.data or []:
         if not _in_period(row.get("transaction_date"), start, end):
@@ -303,30 +307,66 @@ async def live_activity(
     return [SchoolActivityOut(**row) for row in rows]
 
 
+@router.get("/stats/counts")
+async def stats_counts(user: dict = Depends(current_user)) -> dict:
+    """Lightweight count-only endpoint for admin home stat cards.
+
+    Uses a 15-second TTL cache so repeated navigations to the home tab
+    return instantly without hitting the database.
+    """
+    from utils.ttl_cache import get_cached_value, set_cached_value
+
+    s = user["school_id"]
+    cache_key = f"counts:{s}"
+    cached = get_cached_value(cache_key, 15)
+    if cached is not None:
+        return cached
+
+    students, teachers, total_staff = await asyncio.gather(
+        _count_students(s),
+        _count("users", s, role="teacher"),
+        _count_staff(s),
+    )
+    result = {
+        "students": students,
+        "teachers": teachers,
+        "total_staff": total_staff,
+    }
+    set_cached_value(cache_key, result)
+    return result
+
+
 @router.get("/stats")
 async def stats(user: dict = Depends(current_user)) -> dict:
     s = user["school_id"]
+    # Fetch counts first so we can reuse them in attendance pct (avoids duplicate count queries)
+    students, total_staff = await asyncio.gather(
+        _count_students(s),
+        _count_staff(s),
+    )
     (
-        students,
-        total_staff,
         pending_fees,
         announcements,
         student_att,
         staff_att,
         today_ann,
+        teacher_count,
+        parent_count,
+        homework_count,
     ) = await asyncio.gather(
-        _count_students(s),
-        _count_staff(s),
         _sum_pending_fees(s),
         _count("announcements", s),
-        _attendance_pct_today(s, "attendance"),
-        _attendance_pct_today(s, "staff_attendance"),
+        _attendance_pct_today(s, "attendance", total=students),
+        _attendance_pct_today(s, "staff_attendance", total=total_staff),
         _today_announcements(s),
+        _count("users", s, role="teacher"),
+        _count("users", s, role="parent"),
+        _count("homework", s),
     )
     return {
         "students": students,
         "total_staff": total_staff,
-        "teachers": await _count("users", s, role="teacher"),
+        "teachers": teacher_count,
         "pending_fees": pending_fees,
         "announcements": announcements,
         "today_announcements": today_ann,
@@ -334,6 +374,6 @@ async def stats(user: dict = Depends(current_user)) -> dict:
         "staff_attendance_today": staff_att,
         # legacy fields for backward compatibility
         "users": students + total_staff,
-        "parents": await _count("users", s, role="parent"),
-        "homework": await _count("homework", s),
+        "parents": parent_count,
+        "homework": homework_count,
     }

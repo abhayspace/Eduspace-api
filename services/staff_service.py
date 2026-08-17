@@ -1,11 +1,11 @@
 """Non-teaching staff and admin role provisioning."""
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import HTTPException, status
 
 from database import get_client
-from schemas.people import AdminRoleCreateIn, AdminRoleOut, StaffCreateIn, StaffCreateOut, CredentialsOut
+from schemas.people import AdminRoleCreateIn, AdminRoleOut, StaffCreateIn, StaffCreateOut, StaffOut, CredentialsOut
 from utils.codes import generate_employee_no, generate_temp_password, generate_user_code
 from utils.security import hash_password
 
@@ -249,3 +249,42 @@ async def create_staff(school_id: str, body: StaffCreateIn) -> StaffCreateOut:
         employee_no=employee_no,
         credentials=CredentialsOut(user_code=user_code, password=temp_password),
     )
+
+
+async def list_staff(school_id: str) -> List[StaffOut]:
+    client = get_client()
+    roles = list(STAFF_ROLES)
+    res = (
+        await client.table("users")
+        .select("id,full_name,role,email,user_code,mobile")
+        .eq("school_id", school_id)
+        .in_("role", roles)
+        .order("full_name")
+        .execute()
+    )
+    if not res.data:
+        return []
+    user_ids = [row["id"] for row in res.data]
+    profiles_res = (
+        await client.table("staff_profiles")
+        .select("user_id,employee_no,department,qualification,joining_date")
+        .in_("user_id", user_ids)
+        .execute()
+    )
+    profile_map = {p["user_id"]: p for p in (profiles_res.data or [])}
+    result: List[StaffOut] = []
+    for row in res.data:
+        p = profile_map.get(row["id"], {})
+        result.append(StaffOut(
+            id=row["id"],
+            full_name=row["full_name"],
+            role=row["role"],
+            email=row["email"],
+            user_code=row.get("user_code"),
+            mobile=row.get("mobile"),
+            employee_no=p.get("employee_no"),
+            department=p.get("department"),
+            qualification=p.get("qualification"),
+            joining_date=p.get("joining_date"),
+        ))
+    return result

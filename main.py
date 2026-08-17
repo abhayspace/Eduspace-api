@@ -118,6 +118,7 @@ ROUTERS = [
     notifications.router,
     messages.router,
     eddy.router,
+    eddy.public_router,
 ]
 for r in ROUTERS:
     app.include_router(r, prefix="/api")

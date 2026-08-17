@@ -209,7 +209,7 @@ async def register_school(payload: SchoolRegisterIn) -> dict:
 
     await send_email(
         school_email,
-        "Welcome to EduSpace – Your School Management Login Credentials",
+        "Welcome to Eduspace – Your School Management Login Credentials",
         school_email_body,
     )
 

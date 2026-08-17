@@ -1,6 +1,7 @@
 """School calendar — holidays, birthdays, and special days."""
 from __future__ import annotations
 
+import asyncio
 import calendar as cal
 import uuid
 from datetime import date, datetime, timezone
@@ -52,27 +53,38 @@ async def _profile_birthdays(school_id: str, month: int, year: int) -> List[Cale
     client = get_client()
     events: List[CalendarEventOut] = []
 
-    async def append_from_table(
+    async def fetch_table_data(
         table: str,
         person_type: str,
         *,
         select_cols: str = "user_id,dob",
-    ) -> None:
+    ) -> tuple[str, list[dict]]:
         res = await client.table(table).select(select_cols).eq("school_id", school_id).execute()
-        rows = [row for row in (res.data or []) if row.get("dob")]
-        if not rows:
-            return
-        user_ids = [row["user_id"] for row in rows if row.get("user_id")]
-        users_by_id: dict[str, dict] = {}
-        if user_ids:
-            users_res = (
-                await client.table("users")
-                .select("id,full_name,dob")
-                .in_("id", user_ids)
-                .execute()
-            )
-            users_by_id = {row["id"]: row for row in (users_res.data or [])}
+        return person_type, [row for row in (res.data or []) if row.get("dob")]
 
+    # Fetch all 3 tables in parallel
+    results = await asyncio.gather(
+        fetch_table_data("students", "student"),
+        fetch_table_data("teachers", "teacher", select_cols="user_id"),
+        fetch_table_data("staff_profiles", "staff"),
+    )
+
+    # Collect all user_ids across tables for a single batched users query
+    all_user_ids: list[str] = []
+    for _, rows in results:
+        all_user_ids.extend(row.get("user_id") for row in rows if row.get("user_id"))
+
+    users_by_id: dict[str, dict] = {}
+    if all_user_ids:
+        users_res = (
+            await client.table("users")
+            .select("id,full_name,dob")
+            .in_("id", all_user_ids)
+            .execute()
+        )
+        users_by_id = {row["id"]: row for row in (users_res.data or [])}
+
+    for person_type, rows in results:
         for row in rows:
             user_id = row.get("user_id")
             user = users_by_id.get(user_id or "", {})
@@ -103,9 +115,6 @@ async def _profile_birthdays(school_id: str, month: int, year: int) -> List[Cale
                 )
             )
 
-    await append_from_table("students", "student")
-    await append_from_table("teachers", "teacher", select_cols="user_id")
-    await append_from_table("staff_profiles", "staff")
     events.sort(key=lambda item: (item.event_date, item.title.lower()))
     return events
 
@@ -113,10 +122,14 @@ async def _profile_birthdays(school_id: str, month: int, year: int) -> List[Cale
 async def list_month(school_id: str, month: int, year: int) -> CalendarMonthOut:
     month_start, month_end = _month_bounds(month, year)
     client = get_client()
+    # Filter by date range in the query instead of loading all events.
+    # Use gte/lte on event_date and end_date to catch multi-day events spanning the month.
     res = (
         await client.table("school_calendar_events")
         .select(_COLUMNS)
         .eq("school_id", school_id)
+        .lte("event_date", month_end.isoformat())
+        .gte("end_date", month_start.isoformat())
         .execute()
     )
     school_events: List[CalendarEventOut] = []

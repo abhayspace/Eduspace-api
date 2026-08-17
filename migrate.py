@@ -58,6 +58,19 @@ MIGRATION_ORDER = [
     "044_homework_retention_and_fields.sql",
     "045_homework_assigned_by_user.sql",
     "046_message_group_id.sql",
+    "047_student_approval_status.sql",
+    "048_library.sql",
+    "049_teacher_medical.sql",
+    "050_teacher_medical_visits.sql",
+    "051_syllabus.sql",
+    "052_syllabus_chapter_completed.sql",
+    "053_leave_requests.sql",
+    "054_student_settings.sql",
+    "055_achievements.sql",
+    "055_leave_requests_cancel_and_retention.sql",
+    "056_achievements_pin.sql",
+    "057_appointments.sql",
+    "058_school_medical_visits.sql",
 ]
 
 

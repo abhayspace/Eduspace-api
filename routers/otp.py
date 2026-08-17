@@ -22,19 +22,19 @@ class OtpVerifyIn(BaseModel):
     purpose: str = "register"
 
 
-_ALLOWED_OTP_PURPOSES = {"register", "school_profile_email"}
+_ALLOWED_OTP_PURPOSES = {"register", "school_profile_email", "trial"}
 
 
 def _otp_email_body(otp: str) -> str:
     return (
-        f"Your EduSpace Email Verification Code\n"
+        f"Your Eduspace Email Verification Code\n"
         f"{'=' * 42}\n\n"
         f"Your one-time verification code is:\n\n"
         f"    {otp}\n\n"
         f"This code expires in 10 minutes.\n\n"
         f"If you did not request this code, please ignore this email.\n"
         f"Your school registration is not complete until you verify your email.\n\n"
-        f"— The EduSpace Team\n"
+        f"— The Eduspace Team\n"
     )
 
 
@@ -51,7 +51,7 @@ async def send_otp(body: OtpSendIn) -> dict:
     otp = generate_and_store(body.email, purpose=purpose)
     sent = await send_email(
         body.email,
-        "EduSpace – Your Email Verification Code",
+        "Eduspace – Your Email Verification Code",
         _otp_email_body(otp),
     )
     if not sent:

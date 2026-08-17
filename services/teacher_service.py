@@ -1,15 +1,45 @@
 """Teacher CRUD with user account provisioning."""
 import logging
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import HTTPException, status
 
 from database import get_client
-from schemas.people import TeacherCreateIn, TeacherCreateOut, TeacherOut, TeacherUpdateIn, CredentialsOut, StudentDocumentItem
+from schemas.people import (
+    CredentialsOut,
+    StudentDocumentItem,
+    TeacherCreateIn,
+    TeacherCreateOut,
+    TeacherMedicalIn,
+    TeacherMedicalOut,
+    TeacherMedicalVisitOut,
+    TeacherOut,
+    TeacherUpdateIn,
+)
 from utils.codes import generate_employee_no, generate_temp_password, generate_user_code
 from utils.security import hash_password
 
 logger = logging.getLogger("eduspace.teachers")
+
+
+async def _sync_subjects_to_table(school_id: str, subjects: List[str]) -> None:
+    """Ensure any subjects assigned to a teacher exist in the subjects table."""
+    if not subjects:
+        return
+    client = get_client()
+    try:
+        existing = await client.table("subjects").select("name").eq("school_id", school_id).execute()
+        existing_names = {row["name"].lower() for row in (existing.data or [])}
+        to_add = [
+            {"school_id": school_id, "name": s, "code": s[:3].upper()}
+            for s in subjects
+            if s and s.lower() not in existing_names
+        ]
+        if to_add:
+            await client.table("subjects").insert(to_add).execute()
+    except Exception:
+        pass
 
 STAFF_ROLES = {"teacher"}
 
@@ -217,12 +247,26 @@ async def list_teachers(school_id: str) -> List[TeacherOut]:
     user_ids = [p["user_id"] for p in profiles.data if p.get("user_id")]
     users_res = await client.table("users").select("id,email,full_name,mobile,user_code,is_active,gender,dob,address,photo_url,login_password").in_("id", user_ids).execute()
     users_map = {u["id"]: u for u in (users_res.data or [])}
+
+    # Batch-resolve class teacher class/section names to avoid N+1 queries.
+    class_ids = {p.get("class_teacher_class_id") for p in profiles.data if p.get("class_teacher_class_id")}
+    section_ids = {p.get("class_teacher_section_id") for p in profiles.data if p.get("class_teacher_section_id")}
+    class_names_map: dict = {}
+    section_names_map: dict = {}
+    if class_ids:
+        cls_res = await client.table("classes").select("id,name").in_("id", list(class_ids)).execute()
+        class_names_map = {c["id"]: c["name"] for c in (cls_res.data or [])}
+    if section_ids:
+        sec_res = await client.table("sections").select("id,name").in_("id", list(section_ids)).execute()
+        section_names_map = {s["id"]: s["name"] for s in (sec_res.data or [])}
+
     out = []
     for p in profiles.data:
         user = users_map.get(p.get("user_id"))
         if not user:
             continue
-        cn, sn = await _resolve_class_names(school_id, p.get("class_teacher_class_id"), p.get("class_teacher_section_id"))
+        cn = class_names_map.get(p.get("class_teacher_class_id"))
+        sn = section_names_map.get(p.get("class_teacher_section_id"))
         out.append(_build_teacher_out(user, p, cn, sn))
     return sorted(out, key=lambda t: t.full_name.lower())
 
@@ -274,6 +318,108 @@ async def update_teacher_self(
         photo_url=body.photo_url,
     )
     return await update_teacher(school_id, profile.id, personal)
+
+
+MEDICAL_FIELDS = (
+    "height",
+    "weight",
+    "blood_group",
+    "allergies",
+    "conditions",
+    "medications",
+    "emergency_name",
+    "emergency_relation",
+    "emergency_mobile",
+    "notes",
+)
+
+
+def _build_medical_out(profile: dict, user: dict) -> TeacherMedicalOut:
+    return TeacherMedicalOut(
+        teacher_id=profile["id"],
+        full_name=user.get("full_name"),
+        gender=profile.get("gender") or user.get("gender"),
+        dob=profile.get("dob") or user.get("dob"),
+        updated_at=profile.get("medical_updated_at"),
+        **{field: profile.get(f"medical_{field}") for field in MEDICAL_FIELDS},
+    )
+
+
+async def _own_profile_row(school_id: str, user_id: str) -> tuple[dict, dict]:
+    client = get_client()
+    res = (
+        await client.table("teachers")
+        .select("*")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Teacher profile not found")
+    profile = res.data[0]
+    user_res = (
+        await client.table("users")
+        .select("id,full_name,gender,dob")
+        .eq("id", profile["user_id"])
+        .limit(1)
+        .execute()
+    )
+    return profile, (user_res.data[0] if user_res.data else {})
+
+
+async def get_my_medical(school_id: str, user_id: str) -> TeacherMedicalOut:
+    profile, user = await _own_profile_row(school_id, user_id)
+    return _build_medical_out(profile, user)
+
+
+async def update_my_medical(
+    school_id: str,
+    user_id: str,
+    body: TeacherMedicalIn,
+) -> TeacherMedicalOut:
+    profile, _ = await _own_profile_row(school_id, user_id)
+    updates: dict = {}
+    for field in MEDICAL_FIELDS:
+        value = getattr(body, field, None)
+        if value is None:
+            continue
+        cleaned = value.strip()
+        updates[f"medical_{field}"] = cleaned or None
+    updates["medical_updated_at"] = datetime.now(timezone.utc).isoformat()
+    client = get_client()
+    await client.table("teachers").update(updates).eq("id", profile["id"]).execute()
+    return await get_my_medical(school_id, user_id)
+
+
+VISITS_TABLE = "teacher_medical_visits"
+
+
+def _build_visit_out(row: dict) -> TeacherMedicalVisitOut:
+    return TeacherMedicalVisitOut(
+        id=row["id"],
+        visit_date=row["visit_date"],
+        visit_time=row.get("visit_time") or "",
+        issue=row.get("issue") or "",
+        treatment=row.get("treatment") or "",
+        prescription=row.get("prescription") or "",
+        attended_by=row.get("attended_by") or "",
+        created_at=row.get("created_at"),
+    )
+
+
+async def list_my_medical_visits(school_id: str, user_id: str) -> List[TeacherMedicalVisitOut]:
+    client = get_client()
+    res = (
+        await client.table(VISITS_TABLE)
+        .select("*")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .order("visit_date", desc=True)
+        .limit(200)
+        .execute()
+    )
+    return [_build_visit_out(row) for row in (res.data or [])]
 
 
 async def create_teacher(school_id: str, body: TeacherCreateIn) -> TeacherCreateOut:
@@ -375,6 +521,7 @@ async def create_teacher(school_id: str, body: TeacherCreateIn) -> TeacherCreate
 
     cn, sn = await _resolve_class_names(school_id, body.class_teacher_class_id, body.class_teacher_section_id)
     teacher = _build_teacher_out(user, t_ins.data[0], cn, sn)
+    await _sync_subjects_to_table(school_id, body.subjects)
     return TeacherCreateOut(
         teacher=teacher,
         credentials=CredentialsOut(user_code=user_code, password=temp_password),
@@ -443,6 +590,9 @@ async def update_teacher(school_id: str, teacher_id: str, body: TeacherUpdateIn)
             if "uq_class_teacher_assignment" in str(exc):
                 raise HTTPException(status.HTTP_409_CONFLICT, "A class teacher is already assigned to this class-section")
             raise
+
+    if body.subjects is not None:
+        await _sync_subjects_to_table(school_id, body.subjects)
 
     return await get_teacher(school_id, teacher_id)
 

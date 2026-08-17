@@ -147,6 +147,7 @@ def _build_student_out(user: dict, profile: dict, class_name: Optional[str] = No
         documents=_documents_from_profile(profile),
         document_url=profile.get("document_url"),
         document_name=profile.get("document_name"),
+        approval_status=profile.get("approval_status") or "approved",
     )
 
 
@@ -155,6 +156,8 @@ async def list_students(
     class_id: Optional[str] = None,
     section_id: Optional[str] = None,
     search: Optional[str] = None,
+    *,
+    approval_status: Optional[str] = "approved",
 ) -> List[StudentOut]:
     client = get_client()
     query = client.table("students").select("*").eq("school_id", school_id)
@@ -170,17 +173,36 @@ async def list_students(
         "id,email,full_name,mobile,user_code,admission_no,is_active,gender,dob,address,photo_url,login_password"
     ).in_("id", user_ids).execute()
     users_map = {u["id"]: u for u in (users_res.data or [])}
+
+    # Batch-resolve class and section names to avoid N+1 queries.
+    # Collect unique class_ids and section_ids, then fetch in 2 queries.
+    class_ids = {p.get("class_id") for p in res.data if p.get("class_id")}
+    section_ids = {p.get("section_id") for p in res.data if p.get("section_id")}
+    class_names_map: dict = {}
+    section_names_map: dict = {}
+    if class_ids:
+        cls_res = await client.table("classes").select("id,name").in_("id", list(class_ids)).execute()
+        class_names_map = {c["id"]: c["name"] for c in (cls_res.data or [])}
+    if section_ids:
+        sec_res = await client.table("sections").select("id,name").in_("id", list(section_ids)).execute()
+        section_names_map = {s["id"]: s["name"] for s in (sec_res.data or [])}
+
     out = []
     for p in res.data:
         user = users_map.get(p.get("user_id"))
         if not user:
+            continue
+        # Rows created before approval_status column may omit it; treat as approved.
+        row_status = p.get("approval_status") or "approved"
+        if approval_status and row_status != approval_status:
             continue
         if search:
             q = search.lower()
             hay = f"{user['full_name']} {p.get('admission_no','')} {p.get('roll_no','')}".lower()
             if q not in hay:
                 continue
-        cn, sn = await _resolve_class_section(school_id, p.get("class_id"), p.get("section_id"))
+        cn = class_names_map.get(p.get("class_id"))
+        sn = section_names_map.get(p.get("section_id"))
         out.append(_build_student_out(user, p, cn, sn))
     return sorted(out, key=lambda s: (s.class_name or "", s.roll_no or "", s.full_name.lower()))
 
@@ -222,9 +244,73 @@ async def get_student_by_user_id(school_id: str, user_id: str) -> StudentOut:
     return _build_student_out(user_res.data[0], profile, cn, sn)
 
 
-async def create_student(school_id: str, body: StudentCreateIn) -> StudentCreateOut:
+async def create_student(
+    school_id: str,
+    body: StudentCreateIn,
+    *,
+    pending_approval: bool = False,
+    requested_by_user_id: Optional[str] = None,
+) -> StudentCreateOut:
     client = get_client()
-    email = (body.email or f"student_{school_id[:8]}@eduspace.local").lower()
+    
+    # Check school's student_approval_required setting.
+    # Wrapped in try/except so a missing column (migration 054) doesn't
+    # break student creation — defaults to True (safer) if query fails.
+    school_approval_required = True
+    try:
+        school_res = (
+            await client.table("schools")
+            .select("student_approval_required")
+            .eq("id", school_id)
+            .limit(1)
+            .execute()
+        )
+        if school_res.data:
+            school_approval_required = bool(school_res.data[0].get("student_approval_required", True))
+    except Exception:
+        logger.warning("student_approval_required column missing — run migration 054_student_settings.sql")
+    
+    # If school doesn't require approval, override pending_approval to false
+    if not school_approval_required:
+        pending_approval = False
+        requested_by_user_id = None
+    
+    user_code, default_adm, _ = await _next_student_codes(school_id)
+    if body.admission_no and body.admission_no.strip():
+        admission_no = normalize_admission_no(body.admission_no)
+    else:
+        admission_no = default_adm
+
+    if await _admission_taken(school_id, admission_no):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Admission number already used in this school")
+
+    # Duplicate check: same full_name + father_name + guardian_mobile
+    dup_res = (
+        await client.table("students")
+        .select("id,user_id")
+        .eq("school_id", school_id)
+        .ilike("father_name", body.father_name or "")
+        .eq("guardian_mobile", body.guardian_mobile or "")
+        .limit(5)
+        .execute()
+    )
+    if dup_res.data:
+        for row in dup_res.data:
+            u_res = (
+                await client.table("users")
+                .select("full_name")
+                .eq("id", row.get("user_id"))
+                .ilike("full_name", body.full_name)
+                .limit(1)
+                .execute()
+            )
+            if u_res.data:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "A student with the same name, parent name and contact already exists",
+                )
+
+    email = (body.email or f"student_{admission_no}_{school_id[:8]}@eduspace.local").lower()
 
     if body.email:
         existing = (
@@ -238,16 +324,8 @@ async def create_student(school_id: str, body: StudentCreateIn) -> StudentCreate
         if existing.data:
             raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
 
-    user_code, default_adm, _ = await _next_student_codes(school_id)
-    if body.admission_no and body.admission_no.strip():
-        admission_no = normalize_admission_no(body.admission_no)
-    else:
-        admission_no = default_adm
-
-    if await _admission_taken(school_id, admission_no):
-        raise HTTPException(status.HTTP_409_CONFLICT, "Admission number already used in this school")
-
     temp_password = generate_temp_password()
+    approval_status = "pending" if pending_approval else "approved"
 
     user_row = {
         "school_id": school_id,
@@ -264,9 +342,29 @@ async def create_student(school_id: str, body: StudentCreateIn) -> StudentCreate
         "password_hash": hash_password(temp_password),
         "login_password": temp_password,
         "must_change_password": True,
-        "is_active": True,
+        "is_active": not pending_approval,
     }
-    user_ins = await client.table("users").insert(user_row).execute()
+    try:
+        user_ins = await client.table("users").insert(user_row).execute()
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc).lower()
+        # Try removing optional columns that may be missing from older schemas
+        optional_user_cols = ["login_password", "photo_url", "gender", "dob", "mobile", "address"]
+        retry_user = {**user_row}
+        retried = False
+        for col in optional_user_cols:
+            if col in retry_user and col in message:
+                retry_user.pop(col, None)
+                retried = True
+        if retried:
+            try:
+                user_ins = await client.table("users").insert(retry_user).execute()
+            except Exception as retry_exc:  # noqa: BLE001
+                logger.error("Student user creation failed after retry: %s", retry_exc)
+                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create student user")
+        else:
+            logger.error("Student user creation failed: %s", exc)
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create student user")
     if not user_ins.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create student user")
     user = user_ins.data[0]
@@ -294,13 +392,58 @@ async def create_student(school_id: str, body: StudentCreateIn) -> StudentCreate
         "documents": _documents_payload(body.documents),
         "document_url": body.documents[0].document_url if body.documents else None,
         "document_name": body.documents[0].document_name if body.documents else None,
+        "approval_status": approval_status,
+        "requested_by_user_id": requested_by_user_id,
     }
     try:
         s_ins = await client.table("students").insert(student_row).execute()
     except Exception as exc:  # noqa: BLE001
-        await client.table("users").delete().eq("id", user["id"]).execute()
-        logger.error("Student profile creation failed: %s", exc)
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create student profile")
+        message = str(exc).lower()
+        missing_approval = "approval_status" in message or "requested_by_user_id" in message
+        if pending_approval and missing_approval:
+            await client.table("users").delete().eq("id", user["id"]).execute()
+            logger.error("Student request requires migration 047_student_approval_status.sql: %s", exc)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Student requests need database update. Run migrations/047_student_approval_status.sql",
+            )
+        if missing_approval and not pending_approval:
+            student_row.pop("approval_status", None)
+            student_row.pop("requested_by_user_id", None)
+            try:
+                s_ins = await client.table("students").insert(student_row).execute()
+            except Exception as retry_exc:  # noqa: BLE001
+                await client.table("users").delete().eq("id", user["id"]).execute()
+                logger.error("Student profile creation failed: %s", retry_exc)
+                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create student profile")
+        else:
+            # Try progressively removing optional columns that may be missing
+            # from older database schemas (migrations 007-054).
+            optional_cols = [
+                "transport", "pen_number", "aadhar_number", "category",
+                "alternate_mobile", "documents", "document_url", "document_name",
+                "approval_status", "requested_by_user_id",
+            ]
+            retry_row = {**student_row}
+            retried = False
+            for col in optional_cols:
+                if col in retry_row and col in message:
+                    retry_row.pop(col, None)
+                    retried = True
+            if retried:
+                try:
+                    s_ins = await client.table("students").insert(retry_row).execute()
+                except Exception as retry_exc:  # noqa: BLE001
+                    await client.table("users").delete().eq("id", user["id"]).execute()
+                    logger.error("Student profile creation failed after retry: %s", retry_exc)
+                    raise HTTPException(
+                        status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        "Failed to create student profile. Database may need migrations.",
+                    )
+            else:
+                await client.table("users").delete().eq("id", user["id"]).execute()
+                logger.error("Student profile creation failed: %s", exc)
+                raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create student profile")
 
     if not s_ins.data:
         await client.table("users").delete().eq("id", user["id"]).execute()
@@ -311,7 +454,67 @@ async def create_student(school_id: str, body: StudentCreateIn) -> StudentCreate
     return StudentCreateOut(
         student=student,
         credentials=CredentialsOut(user_code=admission_no, password=temp_password),
+        pending_approval=pending_approval,
     )
+
+
+async def approve_student_request(school_id: str, student_id: str) -> StudentOut:
+    client = get_client()
+    profile_res = (
+        await client.table("students")
+        .select("*")
+        .eq("school_id", school_id)
+        .eq("id", student_id)
+        .limit(1)
+        .execute()
+    )
+    if not profile_res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student request not found")
+    profile = profile_res.data[0]
+    if profile.get("approval_status") != "pending":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Student is not pending approval")
+
+    await client.table("students").update({"approval_status": "approved"}).eq("id", student_id).execute()
+    await client.table("users").update({"is_active": True}).eq("id", profile["user_id"]).execute()
+    return await get_student(school_id, student_id)
+
+
+async def reject_student_request(school_id: str, student_id: str) -> None:
+    client = get_client()
+    profile_res = (
+        await client.table("students")
+        .select("id,user_id,approval_status")
+        .eq("school_id", school_id)
+        .eq("id", student_id)
+        .limit(1)
+        .execute()
+    )
+    if not profile_res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student request not found")
+    profile = profile_res.data[0]
+    if profile.get("approval_status") != "pending":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Student is not pending approval")
+    user_id = profile.get("user_id")
+    await client.table("students").delete().eq("id", student_id).execute()
+    if user_id:
+        await client.table("users").delete().eq("id", user_id).execute()
+
+
+async def update_student_self(
+    school_id: str,
+    user_id: str,
+    body: StudentUpdateIn,
+) -> StudentOut:
+    """Students may update their own contact details only."""
+    profile = await get_student_by_user_id(school_id, user_id)
+    personal = StudentUpdateIn(
+        email=body.email,
+        guardian_mobile=body.guardian_mobile,
+        alternate_mobile=body.alternate_mobile,
+        address=body.address,
+        photo_url=body.photo_url,
+    )
+    return await update_student(school_id, profile.id, personal)
 
 
 async def update_student(school_id: str, student_id: str, body: StudentUpdateIn) -> StudentOut:

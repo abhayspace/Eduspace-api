@@ -9,6 +9,7 @@ from schemas.people import (
     ClassTeacherAssignIn,
     SectionOut,
     SectionUpdateIn,
+    SubjectCreateIn,
     SubjectOut,
     TeacherBriefOut,
     TeacherOut,
@@ -62,6 +63,11 @@ async def list_sections(
 @router.get("/subjects", response_model=List[SubjectOut])
 async def list_subjects(user: dict = Depends(current_user)) -> List[SubjectOut]:
     return await academic_service.list_subjects(user["school_id"])
+
+
+@router.post("/subjects", response_model=SubjectOut)
+async def create_subject(payload: SubjectCreateIn, user: dict = Depends(current_user)) -> SubjectOut:
+    return await academic_service.create_subject(user["school_id"], payload.name)
 
 
 @router.get("/teachers", response_model=List[TeacherBriefOut])

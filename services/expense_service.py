@@ -1,6 +1,7 @@
 """Expense / income transactions per school."""
 from __future__ import annotations
 
+import asyncio
 import calendar
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Tuple
@@ -76,6 +77,10 @@ def _to_tx_date(value) -> str:
 
 
 async def _purge_expired_transactions(school_id: str, today: date | None = None) -> None:
+    from utils.ttl_cache import should_run
+
+    if not should_run(f"purge_transactions:{school_id}", ttl_seconds=300):
+        return
     cutoff = transaction_retention_start(today or date.today()).isoformat()
     client = get_client()
     await (
@@ -142,13 +147,7 @@ async def _list_transactions_merged(
     )
     if to_date:
         tx_query = tx_query.lte("transaction_date", to_date)
-    tx_res = (
-        await tx_query.order("transaction_date", desc=True)
-        .order("created_at", desc=True)
-        .limit(fetch_cap)
-        .execute()
-    )
-    manual = [_row_to_out(row) for row in (tx_res.data or [])]
+    tx_query = tx_query.order("transaction_date", desc=True).order("created_at", desc=True).limit(fetch_cap)
 
     pay_query = (
         client.table("payments")
@@ -158,9 +157,10 @@ async def _list_transactions_merged(
     )
     if to_date:
         pay_query = pay_query.lte("paid_at", f"{to_date}T23:59:59")
-    pay_res = (
-        await pay_query.order("paid_at", desc=True).limit(fetch_cap).execute()
-    )
+    pay_query = pay_query.order("paid_at", desc=True).limit(fetch_cap)
+
+    tx_res, pay_res = await asyncio.gather(tx_query.execute(), pay_query.execute())
+    manual = [_row_to_out(row) for row in (tx_res.data or [])]
     payments = pay_res.data or []
     fee_ids = [row.get("fee_id") for row in payments if row.get("fee_id")]
     fee_titles: dict[str, str] = {}

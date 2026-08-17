@@ -16,7 +16,7 @@ ROOT_DIR = Path(__file__).parent
 
 # Load environment variables from backend/.env into the process environment so
 # both os.getenv(...) and the typed Settings below resolve identical values.
-load_dotenv(ROOT_DIR / ".env")
+load_dotenv(ROOT_DIR / ".env", override=True)
 
 
 class Settings(BaseSettings):
@@ -36,12 +36,12 @@ class Settings(BaseSettings):
     # --- Auth (FastAPI-issued JWT) ---
     jwt_secret: str = Field(default="", alias="JWT_SECRET")
     jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
-    jwt_expires_minutes: int = Field(default=60 * 24, alias="JWT_EXPIRES_MINUTES")
+    jwt_expires_minutes: int = Field(default=60 * 24 * 365, alias="JWT_EXPIRES_MINUTES")
 
     # --- Email (Resend) ---
     resend_api_key: str = Field(default="", alias="RESEND_API_KEY")
     resend_from_email: str = Field(
-        default="EduSpace <eduspace@nextforms.in>",
+        default="Eduspace <eduspace@nextforms.in>",
         alias="RESEND_FROM_EMAIL",
     )
 
@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     # --- Payment credential encryption ---
     # Optional Fernet key (url-safe base64 32-byte). If empty, derived from JWT_SECRET.
     payment_credentials_key: str = Field(default="", alias="PAYMENT_CREDENTIALS_KEY")
+
+    # --- Eddy AI (Groq) ---
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
+    groq_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
 
     # --- App ---
     cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
@@ -77,7 +81,7 @@ class Settings(BaseSettings):
             return self.email_from
         if self.email_user:
             return self.email_user
-        return "EduSpace <eduspace@nextforms.in>"
+        return "Eduspace <eduspace@nextforms.in>"
 
     def require_supabase(self) -> None:
         missing = [

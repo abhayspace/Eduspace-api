@@ -124,3 +124,38 @@ def delete_chat_file(school_id: str, filename: str) -> None:
         return
     path = STORAGE_DIR / school_id / safe
     path.unlink(missing_ok=True)
+
+
+def chat_file_exists(school_id: str, filename: str) -> bool:
+    """Check whether a chat media file still exists on the server."""
+    safe = Path(filename).name
+    if safe != filename or ".." in filename:
+        return False
+    return (STORAGE_DIR / school_id / safe).is_file()
+
+
+async def reupload_chat_video(school_id: str, filename: str, file: UploadFile) -> dict:
+    """Re-upload a video file to restore it on the server (from a user's local cache)."""
+    safe = Path(filename).name
+    if safe != filename or ".." in filename:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid filename")
+    ext = Path(safe).suffix.lower()
+    if ext not in VIDEO_EXTENSIONS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only video files can be re-uploaded")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Empty file")
+    if len(content) > MAX_VIDEO_BYTES:
+        limit_mb = MAX_VIDEO_BYTES // (1024 * 1024)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"File must be {limit_mb} MB or smaller")
+
+    folder = STORAGE_DIR / school_id
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / safe).write_bytes(content)
+
+    return {
+        "media_url": f"/api/messages/files/{safe}",
+        "media_type": "video",
+        "restored": True,
+    }

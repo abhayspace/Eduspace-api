@@ -10,6 +10,9 @@ from schemas.people import (
     StudentDocumentOut,
     TeacherCreateIn,
     TeacherCreateOut,
+    TeacherMedicalIn,
+    TeacherMedicalOut,
+    TeacherMedicalVisitOut,
     TeacherOut,
     TeacherUpdateIn,
 )
@@ -37,6 +40,28 @@ async def update_my_teacher_profile(
     user: dict = Depends(require_roles("teacher")),
 ) -> TeacherOut:
     return await teacher_service.update_teacher_self(user["school_id"], user["id"], body)
+
+
+@router.get("/me/medical", response_model=TeacherMedicalOut)
+async def get_my_medical_record(
+    user: dict = Depends(require_roles("teacher")),
+) -> TeacherMedicalOut:
+    return await teacher_service.get_my_medical(user["school_id"], user["id"])
+
+
+@router.put("/me/medical", response_model=TeacherMedicalOut)
+async def update_my_medical_record(
+    body: TeacherMedicalIn,
+    user: dict = Depends(require_roles("teacher")),
+) -> TeacherMedicalOut:
+    return await teacher_service.update_my_medical(user["school_id"], user["id"], body)
+
+
+@router.get("/me/medical/visits", response_model=List[TeacherMedicalVisitOut])
+async def list_my_medical_visits(
+    user: dict = Depends(require_roles("teacher")),
+) -> List[TeacherMedicalVisitOut]:
+    return await teacher_service.list_my_medical_visits(user["school_id"], user["id"])
 
 
 @router.post("/upload-document", response_model=StudentDocumentOut)

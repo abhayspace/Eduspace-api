@@ -4,7 +4,7 @@ If RESEND_API_KEY is not configured, the message is logged instead of sent
 so that flows such as school registration still succeed in development.
 
 All emails are sent from RESEND_FROM_EMAIL (defaults to
-EduSpace <eduspace@nextforms.in>).
+Eduspace <eduspace@nextforms.in>).
 """
 import asyncio
 import logging
@@ -17,7 +17,7 @@ from config import get_settings
 
 logger = logging.getLogger("eduspace.email")
 
-DEFAULT_FROM = "EduSpace <eduspace@nextforms.in>"
+DEFAULT_FROM = "Eduspace <eduspace@nextforms.in>"
 
 
 def _from_address() -> str:
@@ -125,7 +125,7 @@ async def send_support_query_email(
     title_line = f"\nTitle             : {title}" if title else ""
 
     body = f"""
-EduSpace Support Query
+Eduspace Support Query
 ======================
 
 Issue Type        : {issue_label}{title_line}
@@ -139,7 +139,7 @@ Message
 Reply directly to this email to respond to the user ({user_email}).
 """.strip()
 
-    subject = f"EduSpace Support — {title or issue_label}"
+    subject = f"Eduspace Support — {title or issue_label}"
     return await send_email(to_address, subject, body, reply_to=reply_to)
 
 
@@ -157,12 +157,12 @@ def build_school_welcome_email(
     location = ", ".join(p for p in (city, state) if p)
     details = " | ".join(p for p in (board, school_type) if p)
     plain = f"""
-Welcome to EduSpace – Your School Management Login Credentials
+Welcome to Eduspace – Your School Management Login Credentials
 ==============================================================
 
 Dear {school_name} Team,
 
-Congratulations! Your school has been successfully registered on EduSpace.
+Congratulations! Your school has been successfully registered on Eduspace.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SCHOOL DETAILS
@@ -181,7 +181,7 @@ Temporary Password: {temp_password}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HOW TO SIGN IN
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. Open the EduSpace app.
+1. Open the Eduspace app.
 2. Enter your Institution Code: {institution_code}
 3. Open School Management.
 4. Enter your Temporary Password (shown above).
@@ -201,11 +201,11 @@ NEXT STEPS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HELP
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Need help? Use the Help Center inside the EduSpace app.
+Need help? Use the Help Center inside the Eduspace app.
 
-Thank you for choosing EduSpace – empowering modern schools.
+Thank you for choosing Eduspace – empowering modern schools.
 
-— The EduSpace Team
+— The Eduspace Team
 """.strip()
     return plain
 
@@ -220,15 +220,98 @@ def build_admin_welcome_email(
 ) -> str:
     """Deprecated: welcome credentials are sent only to the school email."""
     plain = f"""
-Welcome to EduSpace – School Management Login
+Welcome to Eduspace – School Management Login
 =============================================
 
 Dear {admin_name},
 
-Your school {school_name} is registered on EduSpace.
+Your school {school_name} is registered on Eduspace.
 Login credentials are sent to the school Gmail only.
 Use School Management with the school password.
 
 Institution Code: {institution_code}
+""".strip()
+    return plain
+
+
+def build_trial_welcome_email(
+    *,
+    school_name: str,
+    admin_name: str,
+    institution_code: str,
+    school_email: str,
+    temp_password: str,
+    trial_ends_at: str,
+) -> str:
+    plain = f"""
+Welcome to Eduspace Free Trial – Your Demo School Login Credentials
+====================================================================
+
+Dear {admin_name},
+
+Your free trial for {school_name} has been activated on Eduspace!
+You now have 7 days of full access to explore and test the platform.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TRIAL DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+School Name       : {school_name}
+Trial Valid Until : {trial_ends_at}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SCHOOL MANAGEMENT LOGIN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Institution Code  : {institution_code}
+School Email      : {school_email}
+Temporary Password: {temp_password}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW TO SIGN IN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Open the Eduspace app or website.
+2. Enter your Institution Code: {institution_code}
+3. Open School Management.
+4. Enter your Temporary Password (shown above).
+5. You will be prompted to change your password on first login.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT HAPPENS AFTER THE TRIAL?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+After 7 days, all devices will be logged out and you will see two options:
+• Register Now – Convert your trial into a permanent account. All your data stays.
+• Stop – Your trial school and all its data will be permanently deleted.
+
+⚠️  IMPORTANT: This is a temporary trial account. To keep your data, register before the trial ends.
+
+— The Eduspace Team
+""".strip()
+    return plain
+
+
+def build_trial_expired_email(
+    *,
+    school_name: str,
+    admin_name: str,
+    institution_code: str,
+) -> str:
+    plain = f"""
+Your Eduspace Free Trial Has Expired
+=====================================
+
+Dear {admin_name},
+
+The 7-day free trial for {school_name} (Institution Code: {institution_code}) has ended.
+
+All teachers and students have been logged out. As the administrator, you can still log in to choose one of the following options:
+
+1. Register Now – Convert your trial into a permanent account. All your data (teachers, students, settings) will be preserved, and your details will be auto-filled in the registration form.
+
+2. Stop – Your trial school and all associated data will be permanently deleted from our servers.
+
+You must choose one of these options to continue. There is no option to skip.
+
+To take action, open the Eduspace app and log in with your institution code.
+
+— The Eduspace Team
 """.strip()
     return plain

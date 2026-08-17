@@ -26,11 +26,31 @@ from utils.security import hash_password
 router = APIRouter(prefix="/students", tags=["students"])
 
 
+async def _class_teacher_assignment(school_id: str, user_id: str) -> dict:
+    client = get_client()
+    res = (
+        await client.table("teachers")
+        .select("is_class_teacher,class_teacher_class_id,class_teacher_section_id")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data or not res.data[0].get("is_class_teacher"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only class teachers can request new students")
+    profile = res.data[0]
+    if not profile.get("class_teacher_class_id") or not profile.get("class_teacher_section_id"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Class teacher assignment is incomplete")
+    return profile
+
+
 @router.post("/upload-document", response_model=StudentDocumentOut)
 async def upload_student_document(
     file: UploadFile = File(...),
-    user: dict = Depends(require_roles("school_admin", "principal")),
+    user: dict = Depends(require_roles("school_admin", "principal", "teacher")),
 ) -> StudentDocumentOut:
+    if user["role"] == "teacher":
+        await _class_teacher_assignment(user["school_id"], user["id"])
     saved = await save_student_document(user["school_id"], file)
     return StudentDocumentOut(**saved)
 
@@ -38,8 +58,10 @@ async def upload_student_document(
 @router.delete("/documents/{filename}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_student_document_file(
     filename: str,
-    user: dict = Depends(require_roles("school_admin", "principal")),
+    user: dict = Depends(require_roles("school_admin", "principal", "teacher")),
 ) -> Response:
+    if user["role"] == "teacher":
+        await _class_teacher_assignment(user["school_id"], user["id"])
     delete_student_document(user["school_id"], filename)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -67,6 +89,25 @@ async def get_my_student_profile(
     return student.model_copy(update={"login_password": None})
 
 
+@router.put("/me", response_model=StudentOut)
+async def update_my_student_profile(
+    body: StudentUpdateIn,
+    user: dict = Depends(require_roles("student")),
+) -> StudentOut:
+    student = await student_service.update_student_self(user["school_id"], user["id"], body)
+    return student.model_copy(update={"login_password": None})
+
+
+@router.get("/pending", response_model=List[StudentOut])
+async def list_pending_students(
+    user: dict = Depends(require_roles("school_admin", "principal")),
+) -> List[StudentOut]:
+    return await student_service.list_students(
+        user["school_id"],
+        approval_status="pending",
+    )
+
+
 @router.get("", response_model=List[StudentOut])
 async def list_students(
     class_id: Optional[str] = None,
@@ -74,8 +115,31 @@ async def list_students(
     search: Optional[str] = None,
     user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "teacher")),
 ) -> List[StudentOut]:
-    rows = await student_service.list_students(user["school_id"], class_id, section_id, search)
+    rows = await student_service.list_students(
+        user["school_id"],
+        class_id,
+        section_id,
+        search,
+        approval_status="approved",
+    )
     return [_strip_password_for_teacher(row, user) for row in rows]
+
+
+@router.post("/{student_id}/approve", response_model=StudentOut)
+async def approve_student(
+    student_id: str,
+    user: dict = Depends(require_roles("school_admin", "principal")),
+) -> StudentOut:
+    return await student_service.approve_student_request(user["school_id"], student_id)
+
+
+@router.post("/{student_id}/reject", status_code=status.HTTP_204_NO_CONTENT)
+async def reject_student(
+    student_id: str,
+    user: dict = Depends(require_roles("school_admin", "principal")),
+) -> Response:
+    await student_service.reject_student_request(user["school_id"], student_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/{student_id}", response_model=StudentOut)
@@ -90,8 +154,20 @@ async def get_student(
 @router.post("", response_model=StudentCreateOut, status_code=status.HTTP_201_CREATED)
 async def create_student(
     body: StudentCreateIn,
-    user: dict = Depends(require_roles("school_admin", "principal")),
+    user: dict = Depends(require_roles("school_admin", "principal", "teacher")),
 ) -> StudentCreateOut:
+    if user["role"] == "teacher":
+        assignment = await _class_teacher_assignment(user["school_id"], user["id"])
+        if body.class_id != assignment["class_teacher_class_id"]:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only add students to your class")
+        if body.section_id != assignment["class_teacher_section_id"]:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only add students to your section")
+        return await student_service.create_student(
+            user["school_id"],
+            body,
+            pending_approval=True,
+            requested_by_user_id=user["id"],
+        )
     return await student_service.create_student(user["school_id"], body)
 
 
@@ -128,7 +204,6 @@ async def reset_student_password(
         .execute()
     )
     if not profile.data:
-        from fastapi import HTTPException
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
     user_id = profile.data[0]["user_id"]
     u = (

@@ -350,6 +350,9 @@ class ChatMessage(BaseModel):
     media_url: Optional[str] = None
     media_type: Optional[str] = None
     media_name: Optional[str] = None
+    reply_to_id: Optional[str] = None
+    reply_to_text: Optional[str] = None
+    reply_to_sender: Optional[str] = None
     created_at: datetime = Field(default_factory=_now)
 
 
@@ -366,6 +369,7 @@ class ChatSendIn(BaseModel):
     media_url: Optional[str] = None
     media_type: Optional[str] = None
     media_name: Optional[str] = None
+    reply_to_id: Optional[str] = None
 
     @model_validator(mode="after")
     def require_text_or_media(self) -> "ChatSendIn":
@@ -390,6 +394,7 @@ class ChatPeerOut(BaseModel):
     full_name: str
     role: str
     user_code: str = ""
+    gender: Optional[str] = None
 
 
 class ChatThreadOut(BaseModel):
@@ -397,6 +402,7 @@ class ChatThreadOut(BaseModel):
     peer_name: str
     peer_role: str
     peer_user_code: str = ""
+    peer_gender: Optional[str] = None
     last_message: str
     last_message_at: datetime
     last_sender_id: str = ""

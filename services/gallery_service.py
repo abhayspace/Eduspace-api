@@ -1,6 +1,7 @@
 """Gallery folders and media (scoped per school)."""
 from __future__ import annotations
 
+import asyncio
 from typing import List
 
 from datetime import datetime, timezone
@@ -26,19 +27,17 @@ _MEDIA_COLUMNS = "id,school_id,folder_id,media_type,file_url,file_name,content_t
 
 async def _folder_name_taken(school_id: str, name: str, exclude_id: str | None = None) -> bool:
     client = get_client()
-    res = (
-        await client.table("gallery_folders")
-        .select("id,name")
+    query = (
+        client.table("gallery_folders")
+        .select("id")
         .eq("school_id", school_id)
-        .execute()
+        .ilike("name", name.strip())
+        .limit(1)
     )
-    lowered = name.strip().lower()
-    for row in res.data or []:
-        if exclude_id and row["id"] == exclude_id:
-            continue
-        if (row.get("name") or "").strip().lower() == lowered:
-            return True
-    return False
+    if exclude_id:
+        query = query.neq("id", exclude_id)
+    res = await query.execute()
+    return bool(res.data)
 
 
 async def _get_folder_row(school_id: str, folder_id: str) -> dict:
@@ -58,19 +57,17 @@ async def _get_folder_row(school_id: str, folder_id: str) -> dict:
 
 async def list_folders(school_id: str) -> List[GalleryFolderOut]:
     client = get_client()
-    res = (
-        await client.table("gallery_folders")
+    folders_res, media_res = await asyncio.gather(
+        client.table("gallery_folders")
         .select(_FOLDER_COLUMNS)
         .eq("school_id", school_id)
         .order("created_at", desc=True)
-        .execute()
-    )
-    media_res = (
-        await client.table("gallery_media")
+        .execute(),
+        client.table("gallery_media")
         .select("folder_id,media_type,file_url,created_at")
         .eq("school_id", school_id)
         .order("created_at", desc=True)
-        .execute()
+        .execute(),
     )
     latest_by_folder: dict[str, dict] = {}
     for row in media_res.data or []:
@@ -79,7 +76,7 @@ async def list_folders(school_id: str) -> List[GalleryFolderOut]:
             latest_by_folder[folder_id] = row
 
     folders: List[GalleryFolderOut] = []
-    for row in res.data or []:
+    for row in folders_res.data or []:
         latest = latest_by_folder.get(row["id"])
         folders.append(
             GalleryFolderOut(

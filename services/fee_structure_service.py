@@ -1,6 +1,7 @@
 """Class/section monthly fee structure + student fee generation."""
 from __future__ import annotations
 
+import asyncio
 from calendar import monthrange
 from datetime import date, datetime, timezone
 from typing import Iterable, List, Optional
@@ -66,6 +67,10 @@ def _now() -> datetime:
 
 async def ensure_current_month_fees(school_id: str) -> int:
     """Apply scheduled section fees to all students for the current month."""
+    from utils.ttl_cache import should_run
+
+    if not should_run(f"ensure_monthly_fees:{school_id}", ttl_seconds=600):
+        return 0
     await purge_old_paid_fees(school_id)
     client = get_client()
     try:
@@ -114,6 +119,10 @@ async def ensure_current_month_fees(school_id: str) -> int:
 
 async def purge_old_paid_fees(school_id: str) -> int:
     """Drop paid fee rows older than FEE_RETENTION_MONTHS. Pending dues are kept."""
+    from utils.ttl_cache import should_run
+
+    if not should_run(f"purge_fees:{school_id}", ttl_seconds=600):
+        return 0
     client = get_client()
     cutoff = months_ago_date(FEE_RETENTION_MONTHS).isoformat()
     deleted = 0
@@ -155,19 +164,18 @@ async def purge_old_paid_fees(school_id: str) -> int:
 async def list_fee_structure(school_id: str) -> List[FeeStructureClassOut]:
     await ensure_current_month_fees(school_id)
     client = get_client()
-    classes_res = (
-        await client.table("classes")
-        .select("id,name,sections(id,name)")
-        .eq("school_id", school_id)
-        .order("name")
-        .execute()
-    )
+
     try:
-        fees_res = (
-            await client.table("class_section_fees")
+        classes_res, fees_res = await asyncio.gather(
+            client.table("classes")
+            .select("id,name,sections(id,name)")
+            .eq("school_id", school_id)
+            .order("name")
+            .execute(),
+            client.table("class_section_fees")
             .select("section_id,class_id,monthly_amount")
             .eq("school_id", school_id)
-            .execute()
+            .execute(),
         )
     except APIError as exc:
         _raise_if_missing_fees_table(exc)
@@ -311,48 +319,63 @@ async def _apply_monthly_fees_for_sections(
     client = get_client()
 
     emails_by_section = await _student_emails_for_sections(school_id, section_amounts.keys())
-    touched = 0
 
+    # Collect all emails across sections for batch existence check
+    all_emails: list[str] = []
+    for emails in emails_by_section.values():
+        all_emails.extend(emails)
+    if not all_emails:
+        return 0
+
+    # Batch check: fetch all existing fees for these emails + title in one query
+    existing_res = (
+        await client.table("fees")
+        .select("id,student_email,status,amount")
+        .eq("school_id", school_id)
+        .eq("title", title)
+        .in_("student_email", all_emails)
+        .execute()
+    )
+    existing_map: dict[str, dict] = {}
+    for row in (existing_res.data or []):
+        existing_map[row["student_email"]] = row
+
+    touched = 0
+    to_insert: list[dict] = []
     for section_id, amount in section_amounts.items():
         emails = emails_by_section.get(section_id) or []
         for email in emails:
-            existing = (
-                await client.table("fees")
-                .select("id,status,amount")
-                .eq("school_id", school_id)
-                .eq("student_email", email)
-                .eq("title", title)
-                .limit(1)
-                .execute()
-            )
-            if existing.data:
-                row = existing.data[0]
-                if row.get("status") != "pending":
+            existing = existing_map.get(email)
+            if existing:
+                if existing.get("status") != "pending":
                     continue
-                if overwrite_pending_amount and float(row.get("amount") or 0) != float(amount):
+                if overwrite_pending_amount and float(existing.get("amount") or 0) != float(amount):
                     await (
                         client.table("fees")
                         .update({"amount": amount, "due_date": due})
-                        .eq("id", row["id"])
+                        .eq("id", existing["id"])
                         .execute()
                     )
                     touched += 1
                 continue
-            await (
-                client.table("fees")
-                .insert(
-                    {
-                        "school_id": school_id,
-                        "student_email": email,
-                        "title": title,
-                        "amount": amount,
-                        "due_date": due,
-                        "status": "pending",
-                    }
-                )
-                .execute()
+            to_insert.append(
+                {
+                    "school_id": school_id,
+                    "student_email": email,
+                    "title": title,
+                    "amount": amount,
+                    "due_date": due,
+                    "status": "pending",
+                }
             )
             touched += 1
+
+    # Batch insert all new fees in one query
+    if to_insert:
+        try:
+            await client.table("fees").insert(to_insert).execute()
+        except Exception:
+            pass
     return touched
 
 
@@ -406,60 +429,66 @@ async def school_fee_dashboard_stats(school_id: str) -> dict:
     last_day = monthrange(today.year, today.month)[1]
     month_end = f"{month_prefix}-{last_day:02d}T23:59:59.999999+00:00"
 
-    pending_total = 0.0
-    unpaid_emails: set[str] = set()
-
     page_size = 1000
-    offset = 0
-    while True:
-        res = (
-            await client.table("fees")
-            .select("amount,status,due_date,paid_at,student_email,title")
-            .eq("school_id", school_id)
-            .range(offset, offset + page_size - 1)
-            .execute()
-        )
-        rows = res.data or []
-        for row in rows:
-            status = (row.get("status") or "").lower()
-            try:
-                amount = float(row.get("amount") or 0)
-            except (TypeError, ValueError):
-                amount = 0.0
-            if status == "pending":
-                pending_total += amount
+
+    async def _fetch_pending_fees() -> tuple[float, set[str]]:
+        """Fetch only pending fees — reduces payload vs fetching all fees."""
+        total = 0.0
+        emails: set[str] = set()
+        offset = 0
+        while True:
+            res = (
+                await client.table("fees")
+                .select("amount,due_date,student_email,title")
+                .eq("school_id", school_id)
+                .eq("status", "pending")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            rows = res.data or []
+            for row in rows:
+                try:
+                    total += float(row.get("amount") or 0)
+                except (TypeError, ValueError):
+                    continue
                 due = str(row.get("due_date") or "")
                 title = str(row.get("title") or "").lower()
                 if due.startswith(month_prefix) or month_label in title:
                     email = (row.get("student_email") or "").strip().lower()
                     if email:
-                        unpaid_emails.add(email)
-        if len(rows) < page_size:
-            break
-        offset += page_size
+                        emails.add(email)
+            if len(rows) < page_size:
+                break
+            offset += page_size
+        return total, emails
 
-    # Paid this month = money actually received (full + custom/partial office payments)
-    paid_this_month = 0.0
-    pay_offset = 0
-    while True:
-        pay_res = (
-            await client.table("payments")
-            .select("amount,paid_at")
-            .eq("school_id", school_id)
-            .gte("paid_at", month_start)
-            .lte("paid_at", month_end)
-            .range(pay_offset, pay_offset + page_size - 1)
-            .execute()
-        )
-        pay_rows = pay_res.data or []
-        for row in pay_rows:
-            try:
-                paid_this_month += float(row.get("amount") or 0)
-            except (TypeError, ValueError):
-                continue
-        if len(pay_rows) < page_size:
-            break
-        pay_offset += page_size
+    async def _fetch_payments() -> float:
+        """Fetch payments for the current month."""
+        total = 0.0
+        offset = 0
+        while True:
+            pay_res = (
+                await client.table("payments")
+                .select("amount,paid_at")
+                .eq("school_id", school_id)
+                .gte("paid_at", month_start)
+                .lte("paid_at", month_end)
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            pay_rows = pay_res.data or []
+            for row in pay_rows:
+                try:
+                    total += float(row.get("amount") or 0)
+                except (TypeError, ValueError):
+                    continue
+            if len(pay_rows) < page_size:
+                break
+            offset += page_size
+        return total
+
+    pending_total, unpaid_emails = await _fetch_pending_fees()
+    paid_this_month = await _fetch_payments()
 
     # Fallback if payments table empty but fees were marked paid without ledger rows
     if paid_this_month <= 0:

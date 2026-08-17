@@ -49,6 +49,10 @@ def _month_range(month: int, year: int) -> Tuple[str, str]:
 
 
 async def purge_expired_announcements(school_id: str, today: date | None = None) -> None:
+    from utils.ttl_cache import should_run
+
+    if not should_run(f"purge_announcements:{school_id}", ttl_seconds=300):
+        return
     cutoff = datetime.combine(
         retention_start(today or date.today()),
         time.min,

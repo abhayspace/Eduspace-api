@@ -1,5 +1,5 @@
 """People management schemas — teachers, students, staff."""
-from datetime import date
+from datetime import date, datetime
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -106,6 +106,45 @@ class TeacherOut(BaseModel):
 class TeacherCreateOut(BaseModel):
     teacher: TeacherOut
     credentials: CredentialsOut
+
+
+class TeacherMedicalIn(BaseModel):
+    """Medical details a teacher maintains for themselves."""
+
+    height: Optional[str] = None
+    weight: Optional[str] = None
+    blood_group: Optional[str] = None
+    allergies: Optional[str] = None
+    conditions: Optional[str] = None
+    medications: Optional[str] = None
+    emergency_name: Optional[str] = None
+    emergency_relation: Optional[str] = None
+    emergency_mobile: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class TeacherMedicalOut(TeacherMedicalIn):
+    teacher_id: str
+    full_name: Optional[str] = None
+    gender: Optional[str] = None
+    dob: Optional[date] = None
+    updated_at: Optional[datetime] = None
+
+
+class TeacherMedicalVisitIn(BaseModel):
+    """A visit to the school medical room, logged by the teacher."""
+
+    visit_date: date
+    visit_time: str = ""
+    issue: str = ""
+    treatment: str = ""
+    prescription: str = ""
+    attended_by: str = ""
+
+
+class TeacherMedicalVisitOut(TeacherMedicalVisitIn):
+    id: str
+    created_at: Optional[datetime] = None
 
 
 class StudentCreateIn(BaseModel):
@@ -261,11 +300,13 @@ class StudentOut(BaseModel):
     documents: List[StudentDocumentItem] = Field(default_factory=list)
     document_url: Optional[str] = None
     document_name: Optional[str] = None
+    approval_status: str = "approved"
 
 
 class StudentCreateOut(BaseModel):
     student: StudentOut
     credentials: CredentialsOut
+    pending_approval: bool = False
 
 
 class StaffCreateIn(BaseModel):
@@ -291,6 +332,19 @@ class StaffCreateOut(BaseModel):
     user_code: str
     employee_no: str
     credentials: CredentialsOut
+
+
+class StaffOut(BaseModel):
+    id: str
+    full_name: str
+    role: str
+    email: str
+    user_code: Optional[str] = None
+    mobile: Optional[str] = None
+    employee_no: Optional[str] = None
+    department: Optional[str] = None
+    qualification: Optional[str] = None
+    joining_date: Optional[date] = None
 
 
 class AdminRoleCreateIn(BaseModel):
@@ -370,3 +424,7 @@ class SubjectOut(BaseModel):
     id: str
     name: str
     code: Optional[str] = None
+
+
+class SubjectCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)

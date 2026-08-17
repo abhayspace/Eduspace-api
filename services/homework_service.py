@@ -34,6 +34,10 @@ def _cutoff_iso(today: date | None = None) -> str:
 
 
 async def purge_expired_homework(school_id: str, today: date | None = None) -> None:
+    from utils.ttl_cache import should_run
+
+    if not should_run(f"purge_homework:{school_id}", ttl_seconds=300):
+        return
     cutoff = _cutoff_iso(today)
     client = get_client()
     expired = (

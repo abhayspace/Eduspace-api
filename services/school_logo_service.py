@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import base64
+import io
 import re
 import uuid
 from pathlib import Path
 
 from fastapi import HTTPException, status
+from PIL import Image
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 STORAGE_DIR = ROOT_DIR / "storage" / "school_logos"
@@ -18,6 +20,10 @@ MIME_BY_EXT = {
     ".png": "image/png",
     ".webp": "image/webp",
 }
+
+# Pixels with all channels above this value are treated as "white" and made
+# transparent so logos blend cleanly onto coloured ID-card headers.
+WHITE_THRESHOLD = 240
 
 
 def _safe_ext(filename: str | None, content_type: str | None) -> str:
@@ -40,6 +46,27 @@ def _safe_ext(filename: str | None, content_type: str | None) -> str:
     )
 
 
+def _strip_white_background(content: bytes) -> bytes:
+    """Open the image and convert near-white pixels to transparent.
+
+    Returns PNG bytes so transparency is preserved regardless of the input
+    format (JPG has no alpha channel).
+    """
+    img = Image.open(io.BytesIO(content))
+    img = img.convert("RGBA")
+    data = img.getdata()
+    new_data = []
+    for r, g, b, a in data:
+        if r >= WHITE_THRESHOLD and g >= WHITE_THRESHOLD and b >= WHITE_THRESHOLD:
+            new_data.append((255, 255, 255, 0))
+        else:
+            new_data.append((r, g, b, a))
+    img.putdata(new_data)
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
 def save_school_logo_bytes(
     school_id: str,
     content: bytes,
@@ -52,12 +79,19 @@ def save_school_logo_bytes(
     if len(content) > MAX_BYTES:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Logo must be 5 MB or smaller")
 
-    ext = _safe_ext(filename, content_type)
-    stored_name = f"{uuid.uuid4().hex}{ext}"
+    # Validate the original extension/type first (keeps the public API contract).
+    _safe_ext(filename, content_type)
+
+    try:
+        processed = _strip_white_background(content)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or corrupt logo image") from exc
+
+    stored_name = f"{uuid.uuid4().hex}.png"
     folder = STORAGE_DIR / school_id
     folder.mkdir(parents=True, exist_ok=True)
     dest = folder / stored_name
-    dest.write_bytes(content)
+    dest.write_bytes(processed)
     return f"/api/schools/{school_id}/logo/{stored_name}"
 
 
