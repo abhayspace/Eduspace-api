@@ -30,8 +30,16 @@ def retention_cutoff_iso(today: date | None = None) -> str:
     ).isoformat()
 
 
-async def purge_expired_messages(school_id: str, today: date | None = None) -> None:
-    """Delete messages older than the 1-year window and drop attached media files."""
+async def purge_expired_messages(school_id: str | None, today: date | None = None) -> None:
+    """Delete messages older than the 1-year window and drop attached media files.
+
+    Silently skips when ``school_id`` is missing (e.g. developer accounts that
+    don't belong to any school) — those users have no school-scoped messages to
+    purge, and passing ``None``/``"None"`` into a UUID column raises a Postgres
+    syntax error.
+    """
+    if not school_id:
+        return
     cutoff = retention_cutoff_iso(today)
     client = get_client()
 
@@ -57,13 +65,17 @@ async def purge_expired_messages(school_id: str, today: date | None = None) -> N
     )
 
 
-async def purge_old_video_files(school_id: str, today: date | None = None) -> int:
+async def purge_old_video_files(school_id: str | None, today: date | None = None) -> int:
     """Delete video files older than VIDEO_FILE_TTL_DAYS from server storage.
 
     Message metadata (with media_url) is preserved so users who have the video
     cached locally can re-upload it via the /messages/reupload endpoint.
     Returns the number of files deleted.
+
+    Silently skips when ``school_id`` is missing (developer accounts).
     """
+    if not school_id:
+        return 0
     cutoff = datetime.combine(
         (today or date.today()) - timedelta(days=VIDEO_FILE_TTL_DAYS),
         time.min,

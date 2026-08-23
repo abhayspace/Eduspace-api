@@ -924,7 +924,12 @@ async def list_chat_threads(user: dict = Depends(current_user)) -> List[ChatThre
     me = user["id"]
     me_ids = await _message_actor_ids(user)
     me_id_set = set(me_ids)
-    school_id = user["school_id"]
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Chat threads are only available for users belonging to a school.",
+        )
     await purge_expired_messages(school_id)
     await purge_old_video_files(school_id)
     cutoff = retention_cutoff_iso()
@@ -1148,7 +1153,12 @@ async def list_messages(
     user: dict = Depends(current_user),
 ) -> List[ChatMessage]:
     client = get_client()
-    school_id = user["school_id"]
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Messages are only available for users belonging to a school.",
+        )
     me = user["id"]
     me_ids = await _message_actor_ids(user)
     await purge_expired_messages(school_id)
