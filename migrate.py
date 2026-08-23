@@ -76,6 +76,7 @@ MIGRATION_ORDER = [
     "061_student_medical.sql",
     "062_developer_user.sql",
     "063_help_chat.sql",
+    "064_developer_notes.sql",
 ]
 
 
