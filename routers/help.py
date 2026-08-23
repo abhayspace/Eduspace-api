@@ -143,6 +143,22 @@ async def list_my_help_messages(
     ]
 
 
+@router.delete("/messages", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_my_help_messages(
+    user: dict = Depends(current_user),
+) -> None:
+    """Clear the current user's help conversation."""
+    if user.get("role") == DEVELOPER_ROLE:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Developer cannot clear help messages here.")
+    client = get_client()
+    await (
+        client.table("help_messages")
+        .delete()
+        .eq("user_id", user["id"])
+        .execute()
+    )
+
+
 # ── Developer endpoints ───────────────────────────────────────────────────────
 
 @router.get("/conversations", response_model=List[HelpConversationOut])
