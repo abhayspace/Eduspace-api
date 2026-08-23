@@ -343,6 +343,8 @@ async def _apply_monthly_fees_for_sections(
     touched = 0
     to_insert: list[dict] = []
     for section_id, amount in section_amounts.items():
+        if float(amount) <= 0:
+            continue
         emails = emails_by_section.get(section_id) or []
         for email in emails:
             existing = existing_map.get(email)
@@ -448,9 +450,12 @@ async def school_fee_dashboard_stats(school_id: str) -> dict:
             rows = res.data or []
             for row in rows:
                 try:
-                    total += float(row.get("amount") or 0)
+                    amt = float(row.get("amount") or 0)
                 except (TypeError, ValueError):
                     continue
+                if amt <= 0:
+                    continue
+                total += amt
                 due = str(row.get("due_date") or "")
                 title = str(row.get("title") or "").lower()
                 if due.startswith(month_prefix) or month_label in title:

@@ -1,11 +1,22 @@
 """Student CRUD with user account provisioning."""
 import logging
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import HTTPException, status
 
 from database import get_client
-from schemas.people import StudentCreateIn, StudentCreateOut, StudentOut, StudentUpdateIn, StudentDocumentItem, CredentialsOut
+from schemas.people import (
+    CredentialsOut,
+    StudentCreateIn,
+    StudentCreateOut,
+    StudentDocumentItem,
+    StudentMedicalIn,
+    StudentMedicalOut,
+    StudentMedicalVisitOut,
+    StudentOut,
+    StudentUpdateIn,
+)
 from utils.codes import generate_admission_no, generate_temp_password, generate_user_code, normalize_admission_no
 from utils.security import hash_password
 
@@ -573,3 +584,109 @@ async def delete_student(school_id: str, student_id: str) -> None:
     await client.table("students").delete().eq("id", student_id).execute()
     if user_id:
         await client.table("users").delete().eq("id", user_id).execute()
+
+
+STUDENT_MEDICAL_FIELDS = (
+    "height",
+    "weight",
+    "blood_group",
+    "allergies",
+    "conditions",
+    "medications",
+    "emergency_name",
+    "emergency_relation",
+    "emergency_mobile",
+    "notes",
+)
+
+STUDENT_VISITS_TABLE = "teacher_medical_visits"
+
+
+async def _own_student_profile_row(school_id: str, user_id: str) -> tuple[dict, dict]:
+    client = get_client()
+    res = (
+        await client.table("students")
+        .select("*")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student profile not found")
+    profile = res.data[0]
+    user_res = (
+        await client.table("users")
+        .select("id,full_name,gender,dob")
+        .eq("id", profile["user_id"])
+        .limit(1)
+        .execute()
+    )
+    return profile, (user_res.data[0] if user_res.data else {})
+
+
+def _build_student_medical_out(profile: dict, user: dict) -> StudentMedicalOut:
+    return StudentMedicalOut(
+        student_id=profile["id"],
+        full_name=user.get("full_name"),
+        gender=profile.get("gender") or user.get("gender"),
+        dob=profile.get("dob") or user.get("dob"),
+        updated_at=profile.get("medical_updated_at"),
+        **{field: profile.get(f"medical_{field}") for field in STUDENT_MEDICAL_FIELDS},
+    )
+
+
+async def get_my_medical(school_id: str, user_id: str) -> StudentMedicalOut:
+    profile, user = await _own_student_profile_row(school_id, user_id)
+    return _build_student_medical_out(profile, user)
+
+
+async def update_my_medical(
+    school_id: str,
+    user_id: str,
+    body: StudentMedicalIn,
+) -> StudentMedicalOut:
+    profile, _ = await _own_student_profile_row(school_id, user_id)
+    updates: dict = {}
+    for field in STUDENT_MEDICAL_FIELDS:
+        value = getattr(body, field, None)
+        if value is None:
+            continue
+        cleaned = value.strip()
+        updates[f"medical_{field}"] = cleaned or None
+    updates["medical_updated_at"] = datetime.now(timezone.utc).isoformat()
+    client = get_client()
+    await client.table("students").update(updates).eq("id", profile["id"]).execute()
+    return await get_my_medical(school_id, user_id)
+
+
+def _build_student_visit_out(row: dict) -> StudentMedicalVisitOut:
+    return StudentMedicalVisitOut(
+        id=row["id"],
+        visit_date=row["visit_date"],
+        visit_time=row.get("visit_time") or "",
+        issue=row.get("issue") or "",
+        treatment=row.get("treatment") or "",
+        prescription=row.get("prescription") or "",
+        attended_by=row.get("attended_by") or "",
+        created_at=row.get("created_at"),
+    )
+
+
+async def list_my_medical_visits(school_id: str, user_id: str) -> List[StudentMedicalVisitOut]:
+    """Visits the school doctor logged against this student.
+
+    Visits are stored in the shared teacher_medical_visits table (which also
+    holds student visits via person_role), keyed by user_id.
+    """
+    client = get_client()
+    res = (
+        await client.table(STUDENT_VISITS_TABLE)
+        .select("*")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .order("visit_date", desc=True)
+        .limit(200)
+        .execute()
+    )
+    return [_build_student_visit_out(row) for row in (res.data or [])]

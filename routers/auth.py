@@ -4,11 +4,22 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from database import get_client
-from schemas.auth import ChangePasswordIn, LoginIn, RegisterIn, TokenOut, UserPublic
+from schemas.auth import (
+    ChangePasswordIn,
+    DeveloperForgotResetIn,
+    DeveloperForgotVerifyIn,
+    DeveloperLoginIn,
+    LoginIn,
+    RegisterIn,
+    TokenOut,
+    UserPublic,
+)
 from schemas.common import LOGIN_ROLES, ROLES
 from schemas.forgot import LinkEmailIn
 from services import teacher_service
-from routers.forgot import is_gmail
+from services.email_service import send_email
+from services.otp_service import clear, generate_and_store, is_verified, verify
+from routers.forgot import is_gmail, mask_email
 from utils.deps import current_user, current_user_allow_expired
 from utils.security import create_access_token, hash_password, verify_password
 
@@ -329,3 +340,106 @@ async def link_email(
     if not updated.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
     return await _to_public_enriched(updated.data[0])
+
+
+# ── Developer login (EDUERP institution code) ────────────────────────────────
+
+DEVELOPER_EMAIL = "developer@eduspace.app"
+DEVELOPER_OTP_EMAIL = "abhaytri318@gmail.com"
+_DEVELOPER_OTP_PURPOSE = "developer_forgot"
+
+
+async def _find_developer_user() -> dict | None:
+    client = get_client()
+    res = (
+        await client.table("users")
+        .select(_LOGIN_COLUMNS)
+        .eq("email", DEVELOPER_EMAIL)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _developer_otp_body(otp: str) -> str:
+    return (
+        f"Eduspace – Developer Password Reset Code\n"
+        f"{'=' * 40}\n\n"
+        f"Your one-time password reset code is:\n\n"
+        f"    {otp}\n\n"
+        f"This code expires in 10 minutes.\n\n"
+        f"If you did not request a password reset, you can ignore this email.\n\n"
+        f"— The Eduspace Team\n"
+    )
+
+
+@router.post("/developer/login", response_model=TokenOut)
+async def developer_login(body: DeveloperLoginIn) -> TokenOut:
+    """Developer login via the EDUERP institution code."""
+    user = await _find_developer_user()
+    if not user or not verify_password(body.password, user.get("password_hash", "")):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid developer password")
+    if not user.get("is_active", True):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Developer account is inactive")
+    token = create_access_token(
+        user_id=user["id"],
+        role=user["role"],
+        email=user["email"],
+        school_id=user.get("school_id") or "",
+    )
+    return TokenOut(access_token=token, user=await _to_public_enriched(user))
+
+
+@router.post("/developer/forgot/send-otp")
+async def developer_forgot_send_otp() -> dict:
+    """Send a password-reset OTP to the developer's fixed email."""
+    otp = generate_and_store(DEVELOPER_OTP_EMAIL, purpose=_DEVELOPER_OTP_PURPOSE)
+    sent = await send_email(
+        DEVELOPER_OTP_EMAIL,
+        "Eduspace – Developer Password Reset Code",
+        _developer_otp_body(otp),
+    )
+    if not sent:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Could not send the reset code email. Please try again shortly.",
+        )
+    return {
+        "message": "OTP sent to the developer email.",
+        "masked_email": mask_email(DEVELOPER_OTP_EMAIL),
+    }
+
+
+@router.post("/developer/forgot/verify-otp")
+async def developer_forgot_verify_otp(body: DeveloperForgotVerifyIn) -> dict:
+    if not verify(DEVELOPER_OTP_EMAIL, body.otp, purpose=_DEVELOPER_OTP_PURPOSE):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Invalid or expired OTP. Please request a new one.",
+        )
+    return {"verified": True, "masked_email": mask_email(DEVELOPER_OTP_EMAIL)}
+
+
+@router.post("/developer/forgot/reset-password")
+async def developer_forgot_reset_password(body: DeveloperForgotResetIn) -> dict:
+    if not is_verified(DEVELOPER_OTP_EMAIL, purpose=_DEVELOPER_OTP_PURPOSE):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Please verify the OTP before setting a new password.",
+        )
+    if not verify(DEVELOPER_OTP_EMAIL, body.otp, purpose=_DEVELOPER_OTP_PURPOSE):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Invalid or expired OTP. Please request a new one.",
+        )
+    user = await _find_developer_user()
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Developer account not found")
+    client = get_client()
+    await client.table("users").update({
+        "password_hash": hash_password(body.new_password),
+        "login_password": body.new_password,
+        "must_change_password": False,
+    }).eq("id", user["id"]).execute()
+    clear(DEVELOPER_OTP_EMAIL, purpose=_DEVELOPER_OTP_PURPOSE)
+    return {"message": "Password updated. You can sign in with your new password."}

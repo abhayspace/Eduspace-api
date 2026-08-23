@@ -774,3 +774,402 @@ async def teacher_performance(
         "total_students": len(all_pcts),
         "insight": insight,
     }
+
+
+@router.get("/school-performance/options")
+async def school_performance_options(
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
+) -> dict:
+    """Exams + subjects available across the whole school."""
+    client = get_client()
+    school_id = user["school_id"]
+    if await _is_demo_performance_school(school_id):
+        return _demo_teacher_performance_options()
+
+    exams_res = (
+        await client.table("examinations")
+        .select("name,class_name,subject,exam_date")
+        .eq("school_id", school_id)
+        .order("exam_date", desc=True)
+        .limit(2000)
+        .execute()
+    )
+    rows = exams_res.data or []
+
+    exam_meta: Dict[str, dict] = {}
+    subjects_from_exams: set[str] = set()
+    classes_from_exams: set[str] = set()
+    for row in rows:
+        name = (row.get("name") or "").strip()
+        if not name:
+            continue
+        bucket = exam_meta.setdefault(
+            name,
+            {"name": name, "exam_date": row.get("exam_date"), "subjects": set()},
+        )
+        subject = (row.get("subject") or "").strip()
+        if subject:
+            bucket["subjects"].add(subject)
+            subjects_from_exams.add(subject)
+        class_name = (row.get("class_name") or "").strip()
+        if class_name:
+            classes_from_exams.add(class_name)
+        if row.get("exam_date") and (
+            not bucket.get("exam_date") or str(row["exam_date"]) > str(bucket["exam_date"])
+        ):
+            bucket["exam_date"] = row["exam_date"]
+
+    exams = sorted(
+        [
+            {
+                "name": data["name"],
+                "exam_date": data.get("exam_date"),
+                "subjects": sorted(data["subjects"]),
+            }
+            for data in exam_meta.values()
+        ],
+        key=lambda item: (item.get("exam_date") or "", item["name"]),
+        reverse=True,
+    )
+
+    subjects = sorted(subjects_from_exams, key=lambda value: value.lower())
+    default_exam = exams[0]["name"] if exams else None
+    default_subject = subjects[0] if subjects else None
+    if default_exam and not default_subject:
+        exam_subjects = exams[0].get("subjects") or []
+        default_subject = exam_subjects[0] if exam_subjects else None
+
+    return {
+        "exams": exams,
+        "subjects": subjects,
+        "default_exam": default_exam,
+        "default_subject": default_subject,
+        "classes": sorted(classes_from_exams, key=lambda value: value.lower()),
+    }
+
+
+@router.get("/school-performance")
+async def school_performance(
+    exam_name: str = Query(...),
+    subject: str = Query(...),
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
+) -> dict:
+    """Class-level performance for one exam + subject across the whole school."""
+    client = get_client()
+    school_id = user["school_id"]
+    subject_key = subject.strip()
+    exam_key = exam_name.strip()
+    if await _is_demo_performance_school(school_id):
+        return _demo_teacher_performance(exam_key, subject_key)
+
+    empty = {
+        "exam_name": exam_key,
+        "subject": subject_key,
+        "class_bars": [],
+        "best_class": None,
+        "lowest_class": None,
+        "overall_average": 0,
+        "highest_score": 0,
+        "lowest_score": 0,
+        "total_students": 0,
+        "insight": "No performance data is available for this exam and subject yet.",
+    }
+
+    if not exam_key or not subject_key:
+        return empty
+
+    exams = (
+        await client.table("examinations")
+        .select(_EXAM_COLUMNS)
+        .eq("school_id", school_id)
+        .eq("name", exam_key)
+        .eq("subject", subject_key)
+        .limit(500)
+        .execute()
+    )
+    exam_rows = exams.data or []
+    if not exam_rows:
+        return empty
+
+    exam_ids = [e["id"] for e in exam_rows]
+    exam_by_id = {e["id"]: e for e in exam_rows}
+
+    results = (
+        await client.table("results")
+        .select(_COLUMNS)
+        .eq("school_id", school_id)
+        .in_("examination_id", exam_ids)
+        .limit(5000)
+        .execute()
+    )
+    result_rows = results.data or []
+    if not result_rows:
+        return empty
+
+    class_pcts: Dict[str, List[float]] = defaultdict(list)
+    all_pcts: List[float] = []
+    for row in result_rows:
+        eid = row.get("examination_id") or ""
+        exam = exam_by_id.get(eid) or {}
+        cls = (exam.get("class_name") or "—").strip() or "—"
+        max_marks = float(exam.get("max_marks") or 100) or 100
+        marks = float(row.get("marks_obtained") or 0)
+        pct = max(0.0, min(100.0, (marks / max_marks) * 100))
+        class_pcts[cls].append(pct)
+        all_pcts.append(pct)
+
+    class_bars = []
+    for cls, pcts in sorted(class_pcts.items(), key=lambda kv: kv[0].lower()):
+        avg = sum(pcts) / len(pcts) if pcts else 0
+        class_bars.append(
+            {
+                "class_name": cls,
+                "average_pct": round(avg, 1),
+                "student_count": len(pcts),
+                "highest_pct": round(max(pcts), 1) if pcts else 0,
+                "lowest_pct": round(min(pcts), 1) if pcts else 0,
+            }
+        )
+
+    if not class_bars:
+        return empty
+
+    best = max(class_bars, key=lambda row: row["average_pct"])
+    lowest = min(class_bars, key=lambda row: row["average_pct"])
+    overall = round(sum(all_pcts) / len(all_pcts), 1) if all_pcts else 0
+    highest = round(max(all_pcts), 1) if all_pcts else 0
+    lowest_score = round(min(all_pcts), 1) if all_pcts else 0
+    gap = round(best["average_pct"] - lowest["average_pct"], 1)
+
+    if best["class_name"] == lowest["class_name"]:
+        insight = (
+            f"Class {best['class_name']} averaged {best['average_pct']}% in {subject_key}. "
+            f"Overall average across evaluated students is {overall}%."
+        )
+    else:
+        insight = (
+            f"Class {best['class_name']} achieved the highest average score "
+            f"({best['average_pct']}%). Class {lowest['class_name']} scored "
+            f"{gap}% lower than the top-performing class and may benefit from "
+            f"additional revision before the next assessment."
+        )
+
+    return {
+        "exam_name": exam_key,
+        "subject": subject_key,
+        "class_bars": class_bars,
+        "best_class": {
+            "class_name": best["class_name"],
+            "average_pct": best["average_pct"],
+        },
+        "lowest_class": {
+            "class_name": lowest["class_name"],
+            "average_pct": lowest["average_pct"],
+        },
+        "overall_average": overall,
+        "highest_score": highest,
+        "lowest_score": lowest_score,
+        "total_students": len(all_pcts),
+        "insight": insight,
+    }
+
+
+def _demo_my_performance_options() -> dict:
+    exams = [
+        {"name": "Mid Term Examination", "exam_date": "2026-07-15"},
+        {"name": "Unit Test 2", "exam_date": "2026-06-20"},
+        {"name": "Unit Test 1", "exam_date": "2026-05-10"},
+    ]
+    return {
+        "exams": exams,
+        "default_exam": exams[0]["name"],
+    }
+
+
+def _demo_my_performance(exam_name: str, student_email: str) -> dict:
+    exam_key = (exam_name or "Mid Term Examination").strip() or "Mid Term Examination"
+    rng = _demo_rng("kcpsch-demo-student", exam_key, student_email)
+    subjects = ["Mathematics", "Science", "English", "Social Studies", "Hindi"]
+
+    subject_bars = []
+    all_pcts: List[float] = []
+    for subject in subjects:
+        pct = round(rng.uniform(55.0, 96.0), 1)
+        subject_bars.append({"subject": subject, "pct": pct})
+        all_pcts.append(pct)
+
+    best = max(subject_bars, key=lambda row: row["pct"])
+    lowest = min(subject_bars, key=lambda row: row["pct"])
+    overall = round(sum(all_pcts) / len(all_pcts), 1) if all_pcts else 0
+    gap = round(best["pct"] - lowest["pct"], 1)
+    insight = (
+        f"Strongest in {best['subject']} ({best['pct']}%). "
+        f"{lowest['subject']} is {gap}% behind and could use extra practice "
+        f"before the next assessment."
+    )
+    return {
+        "exam_name": exam_key,
+        "subject_bars": subject_bars,
+        "best_subject": {"subject": best["subject"], "pct": best["pct"]},
+        "lowest_subject": {"subject": lowest["subject"], "pct": lowest["pct"]},
+        "overall_average": overall,
+        "highest_score": max(all_pcts) if all_pcts else 0,
+        "lowest_score": min(all_pcts) if all_pcts else 0,
+        "total_subjects": len(subject_bars),
+        "insight": insight,
+    }
+
+
+@router.get("/my-performance/options")
+async def my_performance_options(
+    user: dict = Depends(require_roles("student")),
+) -> dict:
+    """Exams the logged-in student has results for."""
+    client = get_client()
+    school_id = user["school_id"]
+    if await _is_demo_performance_school(school_id):
+        return _demo_my_performance_options()
+
+    results = (
+        await client.table("results")
+        .select("examination_id")
+        .eq("school_id", school_id)
+        .eq("student_email", user["email"])
+        .limit(1000)
+        .execute()
+    )
+    exam_ids = sorted({r["examination_id"] for r in (results.data or []) if r.get("examination_id")})
+    if not exam_ids:
+        return {"exams": [], "default_exam": None}
+
+    exams_res = (
+        await client.table("examinations")
+        .select("name,exam_date")
+        .eq("school_id", school_id)
+        .in_("id", exam_ids)
+        .execute()
+    )
+    exam_meta: Dict[str, Optional[str]] = {}
+    for row in exams_res.data or []:
+        name = (row.get("name") or "").strip()
+        if not name:
+            continue
+        exam_date = row.get("exam_date")
+        if name not in exam_meta or (exam_date and (not exam_meta[name] or str(exam_date) > str(exam_meta[name]))):
+            exam_meta[name] = exam_date
+
+    exams = sorted(
+        [{"name": name, "exam_date": date} for name, date in exam_meta.items()],
+        key=lambda item: (item.get("exam_date") or "", item["name"]),
+        reverse=True,
+    )
+    return {
+        "exams": exams,
+        "default_exam": exams[0]["name"] if exams else None,
+    }
+
+
+@router.get("/my-performance")
+async def my_performance(
+    exam_name: str = Query(...),
+    user: dict = Depends(require_roles("student")),
+) -> dict:
+    """Subject-wise performance for the logged-in student in one exam."""
+    client = get_client()
+    school_id = user["school_id"]
+    exam_key = exam_name.strip()
+    if await _is_demo_performance_school(school_id):
+        return _demo_my_performance(exam_key, user["email"])
+
+    empty = {
+        "exam_name": exam_key,
+        "subject_bars": [],
+        "best_subject": None,
+        "lowest_subject": None,
+        "overall_average": 0,
+        "highest_score": 0,
+        "lowest_score": 0,
+        "total_subjects": 0,
+        "insight": "No performance data is available for this exam yet.",
+    }
+    if not exam_key:
+        return empty
+
+    exams = (
+        await client.table("examinations")
+        .select(_EXAM_COLUMNS)
+        .eq("school_id", school_id)
+        .eq("name", exam_key)
+        .limit(500)
+        .execute()
+    )
+    exam_rows = exams.data or []
+    if not exam_rows:
+        return empty
+
+    exam_ids = [e["id"] for e in exam_rows]
+    exam_by_id = {e["id"]: e for e in exam_rows}
+
+    results = (
+        await client.table("results")
+        .select(_COLUMNS)
+        .eq("school_id", school_id)
+        .eq("student_email", user["email"])
+        .in_("examination_id", exam_ids)
+        .limit(200)
+        .execute()
+    )
+    result_rows = results.data or []
+    if not result_rows:
+        return empty
+
+    subject_bars = []
+    all_pcts: List[float] = []
+    seen_subjects: set[str] = set()
+    for row in result_rows:
+        eid = row.get("examination_id") or ""
+        exam = exam_by_id.get(eid) or {}
+        subject = (exam.get("subject") or "—").strip() or "—"
+        if subject in seen_subjects:
+            continue
+        seen_subjects.add(subject)
+        max_marks = float(exam.get("max_marks") or 100) or 100
+        marks = float(row.get("marks_obtained") or 0)
+        pct = max(0.0, min(100.0, (marks / max_marks) * 100))
+        subject_bars.append({"subject": subject, "pct": round(pct, 1)})
+        all_pcts.append(pct)
+
+    if not subject_bars:
+        return empty
+
+    subject_bars.sort(key=lambda row: row["subject"].lower())
+    best = max(subject_bars, key=lambda row: row["pct"])
+    lowest = min(subject_bars, key=lambda row: row["pct"])
+    overall = round(sum(all_pcts) / len(all_pcts), 1) if all_pcts else 0
+    highest = round(max(all_pcts), 1) if all_pcts else 0
+    lowest_score = round(min(all_pcts), 1) if all_pcts else 0
+    gap = round(best["pct"] - lowest["pct"], 1)
+
+    if best["subject"] == lowest["subject"]:
+        insight = (
+            f"You scored {best['pct']}% in {best['subject']} for {exam_key}. "
+            f"Overall average across evaluated subjects is {overall}%."
+        )
+    else:
+        insight = (
+            f"Your strongest subject was {best['subject']} ({best['pct']}%). "
+            f"{lowest['subject']} was {gap}% lower and could use some extra "
+            f"revision before the next assessment."
+        )
+
+    return {
+        "exam_name": exam_key,
+        "subject_bars": subject_bars,
+        "best_subject": {"subject": best["subject"], "pct": best["pct"]},
+        "lowest_subject": {"subject": lowest["subject"], "pct": lowest["pct"]},
+        "overall_average": overall,
+        "highest_score": highest,
+        "lowest_score": lowest_score,
+        "total_subjects": len(subject_bars),
+        "insight": insight,
+    }

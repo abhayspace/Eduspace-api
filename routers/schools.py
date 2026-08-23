@@ -18,6 +18,7 @@ from schemas.school import (
     SchoolRegisterOut,
     SchoolSearchIn,
     SchoolSearchResult,
+    SchoolStatsOut,
     TrialRegisterIn,
     TrialRegisterOut,
     TrialStatusOut,
@@ -637,6 +638,76 @@ async def list_schools() -> List[School]:
         .execute()
     )
     return [_to_school(row) for row in (res.data or [])]
+
+
+# Staff roles counted in the "staff" bucket for developer stats.
+_STAFF_STAT_ROLES = {
+    "receptionist", "accountant", "librarian", "transport_manager",
+    "hostel_warden", "hostel_manager", "school_doctor",
+    "principal", "vice_principal",
+}
+
+
+@router.get("/all-stats", response_model=List[SchoolStatsOut])
+async def all_school_stats(
+    user: dict = Depends(require_roles("developer")),
+) -> List[SchoolStatsOut]:
+    """Developer-only: list every school with student/teacher/staff counts."""
+    client = get_client()
+    schools_res = (
+        await client.table("schools")
+        .select("id,school_name,institution_code,is_active,is_trial,city,state")
+        .order("school_name")
+        .limit(1000)
+        .execute()
+    )
+    schools = schools_res.data or []
+    if not schools:
+        return []
+
+    school_ids = [s["id"] for s in schools]
+
+    # Count users per school grouped by role bucket.
+    users_res = (
+        await client.table("users")
+        .select("school_id,role,is_active")
+        .in_("school_id", school_ids)
+        .execute()
+    )
+    counts: dict[str, dict[str, int]] = {}
+    for row in users_res.data or []:
+        sid = row.get("school_id")
+        if not sid:
+            continue
+        if sid not in counts:
+            counts[sid] = {"student": 0, "teacher": 0, "staff": 0}
+        role = row.get("role") or ""
+        if not row.get("is_active", True):
+            continue
+        if role == "student":
+            counts[sid]["student"] += 1
+        elif role == "teacher":
+            counts[sid]["teacher"] += 1
+        elif role in _STAFF_STAT_ROLES or role == "school_admin":
+            counts[sid]["staff"] += 1
+
+    results: list[SchoolStatsOut] = []
+    for s in schools:
+        sid = s["id"]
+        c = counts.get(sid, {"student": 0, "teacher": 0, "staff": 0})
+        results.append(SchoolStatsOut(
+            id=sid,
+            school_name=s.get("school_name") or "",
+            institution_code=s.get("institution_code") or "",
+            is_active=s.get("is_active", True),
+            is_trial=s.get("is_trial", False),
+            city=s.get("city"),
+            state=s.get("state"),
+            student_count=c["student"],
+            teacher_count=c["teacher"],
+            staff_count=c["staff"],
+        ))
+    return results
 
 
 @router.post("/search", response_model=List[SchoolSearchResult])

@@ -10,6 +10,9 @@ from schemas.people import (
     StudentCreateIn,
     StudentCreateOut,
     StudentDocumentOut,
+    StudentMedicalIn,
+    StudentMedicalOut,
+    StudentMedicalVisitOut,
     StudentOut,
     StudentUpdateIn,
 )
@@ -96,6 +99,28 @@ async def update_my_student_profile(
 ) -> StudentOut:
     student = await student_service.update_student_self(user["school_id"], user["id"], body)
     return student.model_copy(update={"login_password": None})
+
+
+@router.get("/me/medical", response_model=StudentMedicalOut)
+async def get_my_medical_record(
+    user: dict = Depends(require_roles("student")),
+) -> StudentMedicalOut:
+    return await student_service.get_my_medical(user["school_id"], user["id"])
+
+
+@router.put("/me/medical", response_model=StudentMedicalOut)
+async def update_my_medical_record(
+    body: StudentMedicalIn,
+    user: dict = Depends(require_roles("student")),
+) -> StudentMedicalOut:
+    return await student_service.update_my_medical(user["school_id"], user["id"], body)
+
+
+@router.get("/me/medical/visits", response_model=List[StudentMedicalVisitOut])
+async def list_my_medical_visits(
+    user: dict = Depends(require_roles("student")),
+) -> List[StudentMedicalVisitOut]:
+    return await student_service.list_my_medical_visits(user["school_id"], user["id"])
 
 
 @router.get("/pending", response_model=List[StudentOut])

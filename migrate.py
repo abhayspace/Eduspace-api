@@ -71,6 +71,10 @@ MIGRATION_ORDER = [
     "056_achievements_pin.sql",
     "057_appointments.sql",
     "058_school_medical_visits.sql",
+    "059_free_trial.sql",
+    "060_school_feed.sql",
+    "061_student_medical.sql",
+    "062_developer_user.sql",
 ]
 
 

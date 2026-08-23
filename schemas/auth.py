@@ -9,7 +9,7 @@ class UserPublic(BaseModel):
     email: EmailStr
     full_name: str
     role: str
-    school_id: str
+    school_id: Optional[str] = None
     admission_no: Optional[str] = None
     user_code: Optional[str] = None
     is_active: bool = True
@@ -54,3 +54,18 @@ class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserPublic
+
+
+# ── Developer login (EDUERP institution code) ────────────────────────────────
+
+class DeveloperLoginIn(BaseModel):
+    password: str = Field(min_length=1)
+
+
+class DeveloperForgotVerifyIn(BaseModel):
+    otp: str = Field(min_length=1)
+
+
+class DeveloperForgotResetIn(BaseModel):
+    otp: str = Field(min_length=1)
+    new_password: str = Field(min_length=6)

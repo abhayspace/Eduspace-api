@@ -182,3 +182,20 @@ class TrialStatusOut(BaseModel):
     institution_code: Optional[str] = Field(default=None, alias="institutionCode")
 
     model_config = {"populate_by_name": True}
+
+
+class SchoolStatsOut(BaseModel):
+    """Per-school summary for the developer dashboard."""
+
+    id: str
+    school_name: str = Field(alias="schoolName")
+    institution_code: str = Field(alias="institutionCode")
+    is_active: bool = Field(default=True, alias="isActive")
+    is_trial: bool = Field(default=False, alias="isTrial")
+    city: Optional[str] = None
+    state: Optional[str] = None
+    student_count: int = Field(default=0, alias="studentCount")
+    teacher_count: int = Field(default=0, alias="teacherCount")
+    staff_count: int = Field(default=0, alias="staffCount")
+
+    model_config = {"populate_by_name": True}

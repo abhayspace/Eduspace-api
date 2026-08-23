@@ -147,6 +147,40 @@ class TeacherMedicalVisitOut(TeacherMedicalVisitIn):
     created_at: Optional[datetime] = None
 
 
+class StudentMedicalIn(BaseModel):
+    """Medical details a student maintains for themselves."""
+
+    height: Optional[str] = None
+    weight: Optional[str] = None
+    blood_group: Optional[str] = None
+    allergies: Optional[str] = None
+    conditions: Optional[str] = None
+    medications: Optional[str] = None
+    emergency_name: Optional[str] = None
+    emergency_relation: Optional[str] = None
+    emergency_mobile: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class StudentMedicalOut(StudentMedicalIn):
+    student_id: str
+    full_name: Optional[str] = None
+    gender: Optional[str] = None
+    dob: Optional[date] = None
+    updated_at: Optional[datetime] = None
+
+
+class StudentMedicalVisitOut(BaseModel):
+    id: str
+    visit_date: date
+    visit_time: str = ""
+    issue: str = ""
+    treatment: str = ""
+    prescription: str = ""
+    attended_by: str = ""
+    created_at: Optional[datetime] = None
+
+
 class StudentCreateIn(BaseModel):
     admission_no: Optional[str] = None
     full_name: str = Field(min_length=1)
