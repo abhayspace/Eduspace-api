@@ -6,6 +6,9 @@
 -- The password can be changed via the developer forgot-password flow
 -- (OTP sent to abhaytri318@gmail.com) or the change-password endpoint.
 
+-- Allow platform-level users (developer, super_admin) to have no school.
+alter table users alter column school_id drop not null;
+
 insert into users (email, full_name, role, school_id, is_active, password_hash, login_password, user_code)
 select
     'developer@eduspace.app',
