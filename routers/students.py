@@ -92,6 +92,18 @@ async def get_my_student_profile(
     return student.model_copy(update={"login_password": None})
 
 
+@router.get("/me/classmates")
+async def get_my_class_group_members(
+    user: dict = Depends(require_roles("student")),
+) -> dict:
+    """Classmates + teachers assigned to the student's section (user_ids).
+
+    Used by the frontend to auto-populate the student's class chat group,
+    mirroring how teacher/admin class groups are populated.
+    """
+    return await student_service.get_my_class_group_members(user["school_id"], user["id"])
+
+
 @router.put("/me", response_model=StudentOut)
 async def update_my_student_profile(
     body: StudentUpdateIn,
@@ -148,6 +160,16 @@ async def list_students(
         approval_status="approved",
     )
     return [_strip_password_for_teacher(row, user) for row in rows]
+
+
+@router.get("/by-user/{user_id}", response_model=StudentOut)
+async def get_student_by_user(
+    user_id: str,
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "teacher")),
+) -> StudentOut:
+    """Look up a student by their user_id (used by calendar birthday navigation)."""
+    student = await student_service.get_student_by_user_id(user["school_id"], user_id)
+    return _strip_password_for_teacher(student, user)
 
 
 @router.post("/{student_id}/approve", response_model=StudentOut)

@@ -392,3 +392,66 @@ async def my_staff_attendance_summary(
         period_label=_period_label(view, selected_year, selected_month),
         days=_period_days(clamped_start, period_end, marks_by_date, holiday_ranges),
     )
+
+
+async def my_student_attendance_summary(
+    user: dict,
+    *,
+    view: str = "monthly",
+    month: int | None = None,
+    year: int | None = None,
+) -> StaffAttendanceSummaryOut:
+    """Student's own attendance summary — mirrors my_staff_attendance_summary
+    but queries the ``attendance`` table by ``student_email``."""
+    if view not in {"monthly", "yearly"}:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "view must be monthly or yearly")
+
+    school_id = user["school_id"]
+    student_email = (user.get("email") or "").strip().lower()
+    if not student_email:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Student email not found")
+
+    today = date.today()
+    selected_year = year or today.year
+    selected_month = month or today.month
+    if selected_month < 1 or selected_month > 12:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "month must be between 1 and 12")
+
+    retention_start_date = retention_start(today)
+    period_start, period_end = _period_bounds_for_view(
+        view,
+        selected_year,
+        selected_month,
+        today,
+    )
+
+    fetch_start = min(period_start, retention_start_date)
+    client = get_client()
+    res = (
+        await client.table("attendance")
+        .select("date,status")
+        .eq("school_id", school_id)
+        .eq("student_email", student_email)
+        .gte("date", max(fetch_start, retention_start_date).isoformat())
+        .lte("date", max(period_end, period_start).isoformat())
+        .execute()
+    )
+    marks_by_date: dict[str, str] = {}
+    for row in res.data or []:
+        key = str(row.get("date") or "").strip()
+        status = str(row.get("status") or "").strip().lower()
+        if key and status:
+            marks_by_date[key] = status
+
+    holiday_years = {period_start.year, period_end.year, today.year}
+    holiday_ranges: List[Tuple[date, date]] = []
+    for holiday_year in sorted(holiday_years):
+        holiday_ranges.extend(await _holiday_ranges_for_year(school_id, holiday_year))
+
+    clamped_start = max(period_start, retention_start_date)
+    return StaffAttendanceSummaryOut(
+        period=_summarize_period(clamped_start, period_end, marks_by_date, holiday_ranges),
+        today=_today_label(today, marks_by_date, holiday_ranges),
+        period_label=_period_label(view, selected_year, selected_month),
+        days=_period_days(clamped_start, period_end, marks_by_date, holiday_ranges),
+    )

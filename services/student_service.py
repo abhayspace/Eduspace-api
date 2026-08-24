@@ -690,3 +690,113 @@ async def list_my_medical_visits(school_id: str, user_id: str) -> List[StudentMe
         .execute()
     )
     return [_build_student_visit_out(row) for row in (res.data or [])]
+
+
+def _teacher_teaches_section(
+    assignments: List[str],
+    *,
+    class_name: str,
+    section_name: str,
+    is_class_teacher: bool,
+    class_id: str,
+    section_id: str,
+    ct_class_id: Optional[str],
+    ct_section_id: Optional[str],
+) -> bool:
+    class_key = class_name.strip().lower()
+    section_key = section_name.strip().lower()
+    for entry in assignments or []:
+        value = (entry or "").strip()
+        if not value:
+            continue
+        sep = " - "
+        cut = value.rfind(sep)
+        entry_class = value[:cut].strip().lower() if cut > 0 else value.lower()
+        entry_section = value[cut + len(sep) :].strip().lower() if cut > 0 else ""
+        if entry_class != class_key:
+            continue
+        if entry_section in {"", "all sections"} or entry_section == section_key:
+            return True
+    if is_class_teacher:
+        if ct_class_id and ct_section_id and ct_class_id == class_id and ct_section_id == section_id:
+            return True
+    return False
+
+
+async def get_my_class_group_members(school_id: str, user_id: str) -> dict:
+    """Return user_ids of classmates + teachers assigned to the student's section.
+
+    Used by the frontend to auto-populate the student's class chat group members,
+    mirroring how teacher/admin class groups are populated.
+    """
+    client = get_client()
+    me_res = (
+        await client.table("students")
+        .select("class_id,section_id")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not me_res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student profile not found")
+    profile = me_res.data[0]
+    class_id = (profile.get("class_id") or "").strip()
+    section_id = (profile.get("section_id") or "").strip()
+    if not class_id or not section_id:
+        return {"class_id": None, "section_id": None, "member_user_ids": [user_id]}
+
+    classmates = (
+        await client.table("students")
+        .select("user_id")
+        .eq("school_id", school_id)
+        .eq("class_id", class_id)
+        .eq("section_id", section_id)
+        .execute()
+    )
+    member_ids = [row["user_id"] for row in (classmates.data or []) if row.get("user_id")]
+
+    class_res = (
+        await client.table("classes")
+        .select("name")
+        .eq("school_id", school_id)
+        .eq("id", class_id)
+        .limit(1)
+        .execute()
+    )
+    section_res = (
+        await client.table("sections")
+        .select("name")
+        .eq("school_id", school_id)
+        .eq("id", section_id)
+        .limit(1)
+        .execute()
+    )
+    class_name = (class_res.data or [{}])[0].get("name") or ""
+    section_name = (section_res.data or [{}])[0].get("name") or ""
+
+    teachers = (
+        await client.table("teachers")
+        .select(
+            "user_id,classes_teaching,is_class_teacher,class_teacher_class_id,class_teacher_section_id"
+        )
+        .eq("school_id", school_id)
+        .execute()
+    )
+    for tprofile in teachers.data or []:
+        if _teacher_teaches_section(
+            tprofile.get("classes_teaching") or [],
+            class_name=class_name,
+            section_name=section_name,
+            is_class_teacher=bool(tprofile.get("is_class_teacher")),
+            class_id=class_id,
+            section_id=section_id,
+            ct_class_id=tprofile.get("class_teacher_class_id"),
+            ct_section_id=tprofile.get("class_teacher_section_id"),
+        ):
+            uid = tprofile.get("user_id")
+            if uid:
+                member_ids.append(uid)
+
+    member_ids = list(dict.fromkeys([*member_ids, user_id]))
+    return {"class_id": class_id, "section_id": section_id, "member_user_ids": member_ids}

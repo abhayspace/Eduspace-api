@@ -16,6 +16,7 @@ class CalendarEventOut(BaseModel):
     end_date: Optional[date] = None
     source: str = "school"
     person_type: Optional[str] = None
+    person_user_id: Optional[str] = None
     created_by: Optional[str] = None
     created_at: Optional[datetime] = None
 

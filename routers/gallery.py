@@ -16,7 +16,7 @@ from utils.deps import require_roles
 
 router = APIRouter(prefix="/gallery", tags=["gallery"])
 
-_GALLERY_VIEW_ROLES = ("school_admin", "principal", "vice_principal", "teacher")
+_GALLERY_VIEW_ROLES = ("school_admin", "principal", "vice_principal", "teacher", "student")
 _GALLERY_MANAGE_ROLES = ("school_admin", "principal", "vice_principal")
 
 

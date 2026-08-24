@@ -9,10 +9,13 @@ from fastapi import HTTPException, UploadFile, status
 from database import get_client
 from schemas.feed import (
     FeedCommentOut,
+    FeedCommentUpdateIn,
     FeedLikeOut,
     FeedMediaOut,
     FeedPostCreateIn,
     FeedPostOut,
+    FeedPostUpdateIn,
+    FeedRestrictionOut,
 )
 from services import feed_media_service
 
@@ -31,6 +34,7 @@ async def _hydrate_posts(school_id: str, rows: List[dict], viewer_id: str) -> Li
     if not rows:
         return []
     post_ids = [row["id"] for row in rows]
+    author_ids = list({row["author_id"] for row in rows if row.get("author_id")})
     client = get_client()
 
     media_res = (
@@ -67,12 +71,59 @@ async def _hydrate_posts(school_id: str, rows: List[dict], viewer_id: str) -> Li
     for row in comments_res.data or []:
         comment_counts[row["post_id"]] += 1
 
+    # Author profile info (gender + user_code) so the app can render the same
+    # avatar it uses in Messages. Teachers table is a fallback for gender.
+    author_gender: Dict[str, Optional[str]] = {}
+    author_user_code: Dict[str, str] = {}
+    if author_ids:
+        users_res = (
+            await client.table("users")
+            .select("id,gender,user_code")
+            .in_("id", author_ids)
+            .execute()
+        )
+        missing_gender: List[str] = []
+        for row in users_res.data or []:
+            uid = row["id"]
+            author_user_code[uid] = row.get("user_code") or ""
+            if row.get("gender"):
+                author_gender[uid] = row["gender"]
+            else:
+                missing_gender.append(uid)
+        if missing_gender:
+            teacher_res = (
+                await client.table("teachers")
+                .select("user_id,gender")
+                .in_("user_id", missing_gender)
+                .execute()
+            )
+            for row in teacher_res.data or []:
+                if row.get("gender"):
+                    author_gender[row["user_id"]] = row["gender"]
+
+    # Restriction status per author (admin can stop a person from posting).
+    restricted_authors: set[str] = set()
+    if author_ids:
+        restr_res = (
+            await client.table("feed_posting_restrictions")
+            .select("user_id")
+            .eq("school_id", school_id)
+            .in_("user_id", author_ids)
+            .execute()
+        )
+        for row in restr_res.data or []:
+            restricted_authors.add(row["user_id"])
+
     out: List[FeedPostOut] = []
     for row in rows:
         pid = row["id"]
+        aid = row.get("author_id")
         out.append(
             FeedPostOut(
                 **row,
+                author_gender=author_gender.get(aid),
+                author_user_code=author_user_code.get(aid, ""),
+                author_restricted=aid in restricted_authors,
                 media=[FeedMediaOut(**m) for m in media_by_post.get(pid, [])],
                 like_count=like_counts.get(pid, 0),
                 comment_count=comment_counts.get(pid, 0),
@@ -123,12 +174,31 @@ async def get_post(school_id: str, post_id: str, viewer_id: str) -> FeedPostOut:
     return hydrated[0]
 
 
+async def _is_restricted(school_id: str, user_id: str) -> bool:
+    client = get_client()
+    res = (
+        await client.table("feed_posting_restrictions")
+        .select("id")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
+
+
 async def create_post(school_id: str, user: dict, body: FeedPostCreateIn) -> FeedPostOut:
     caption = (body.caption or "").strip()
     media_urls = [u for u in (body.media_urls or []) if u]
     if not caption and not media_urls:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "Add a caption or at least one photo to post."
+        )
+
+    if await _is_restricted(school_id, user["id"]):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You are restricted from posting to the School Feed. Contact your school admin.",
         )
 
     client = get_client()
@@ -200,6 +270,104 @@ async def delete_post(school_id: str, post_id: str, user: dict) -> None:
     await client.table("feed_posts").delete().eq("school_id", school_id).eq(
         "id", post_id
     ).execute()
+
+
+async def update_post(school_id: str, post_id: str, user: dict, body: FeedPostUpdateIn) -> FeedPostOut:
+    """Edit a post's caption. Author or admin can edit."""
+    client = get_client()
+    res = (
+        await client.table("feed_posts")
+        .select("id,author_id")
+        .eq("school_id", school_id)
+        .eq("id", post_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Post not found")
+    post = res.data[0]
+    if post["author_id"] != user["id"] and user.get("role") not in _ADMIN_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You can't edit this post")
+
+    caption = (body.caption or "").strip()
+    await (
+        client.table("feed_posts")
+        .update({"caption": caption})
+        .eq("school_id", school_id)
+        .eq("id", post_id)
+        .execute()
+    )
+    return await get_post(school_id, post_id, user["id"])
+
+
+async def restrict_author(school_id: str, user_id: str, admin: dict, reason: str) -> FeedRestrictionOut:
+    """Admin stops a person from creating new feed posts."""
+    if user_id == admin["id"]:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "You can't restrict yourself")
+    client = get_client()
+    target_res = (
+        await client.table("users")
+        .select("id,role")
+        .eq("school_id", school_id)
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not target_res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Person not found")
+    if target_res.data[0].get("role") in _ADMIN_ROLES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Admins cannot be restricted")
+
+    existing = (
+        await client.table("feed_posting_restrictions")
+        .select("id,user_id,restricted_by,reason,created_at")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        row = existing.data[0]
+        return FeedRestrictionOut(
+            user_id=row["user_id"],
+            restricted_by=row.get("restricted_by"),
+            reason=row.get("reason") or "",
+            created_at=row.get("created_at"),
+        )
+
+    inserted = (
+        await client.table("feed_posting_restrictions")
+        .insert(
+            {
+                "school_id": school_id,
+                "user_id": user_id,
+                "restricted_by": admin["id"],
+                "reason": (reason or "").strip(),
+            }
+        )
+        .execute()
+    )
+    if not inserted.data:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to restrict person")
+    row = inserted.data[0]
+    return FeedRestrictionOut(
+        user_id=row["user_id"],
+        restricted_by=row.get("restricted_by"),
+        reason=row.get("reason") or "",
+        created_at=row.get("created_at"),
+    )
+
+
+async def unrestrict_author(school_id: str, user_id: str) -> None:
+    """Admin lifts a feed posting restriction."""
+    client = get_client()
+    await (
+        client.table("feed_posting_restrictions")
+        .delete()
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
 
 
 async def toggle_like(school_id: str, post_id: str, user_id: str) -> FeedLikeOut:
@@ -311,3 +479,38 @@ async def delete_comment(school_id: str, comment_id: str, user: dict) -> None:
     if comment["user_id"] != user["id"] and user.get("role") not in _ADMIN_ROLES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You can't delete this comment")
     await client.table("feed_comments").delete().eq("id", comment_id).execute()
+
+
+async def update_comment(
+    school_id: str, comment_id: str, user: dict, body: FeedCommentUpdateIn
+) -> FeedCommentOut:
+    """Edit a comment's text. Author or admin can edit."""
+    client = get_client()
+    res = (
+        await client.table("feed_comments")
+        .select(_COMMENT_COLUMNS)
+        .eq("school_id", school_id)
+        .eq("id", comment_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Comment not found")
+    comment = res.data[0]
+    if comment["user_id"] != user["id"] and user.get("role") not in _ADMIN_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You can't edit this comment")
+
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Comment can't be empty")
+
+    updated = (
+        await client.table("feed_comments")
+        .update({"text": text})
+        .eq("school_id", school_id)
+        .eq("id", comment_id)
+        .execute()
+    )
+    if not updated.data:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to update comment")
+    return FeedCommentOut(**updated.data[0])

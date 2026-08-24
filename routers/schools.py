@@ -448,7 +448,7 @@ async def get_my_school_brand(user: dict = Depends(current_user)) -> SchoolBrand
     client = get_client()
     res = (
         await client.table("schools")
-        .select("school_name,logo_url,email,phone,address,city")
+        .select("school_name,app_display_name,logo_url,use_school_logo,email,phone,address,city")
         .eq("id", school_id)
         .limit(1)
         .execute()
@@ -458,7 +458,9 @@ async def get_my_school_brand(user: dict = Depends(current_user)) -> SchoolBrand
     row = res.data[0]
     return SchoolBrandOut(
         school_name=(row.get("school_name") or "").strip(),
+        app_display_name=row.get("app_display_name"),
         logo_url=row.get("logo_url"),
+        use_school_logo=bool(row.get("use_school_logo", False)),
         school_email=row.get("email"),
         school_phone=row.get("phone"),
         address=row.get("address"),
@@ -527,6 +529,18 @@ async def update_my_school_profile(
     current = await _fetch_school_profile_row(school_id)
 
     updates: dict = {}
+    if body.app_display_name is not None:
+        name = body.app_display_name.strip()
+        if len(name) < 2:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "App name must be at least 2 characters")
+        updates["app_display_name"] = name or None
+    if body.use_school_logo is not None:
+        if body.use_school_logo and not current.get("logo_url"):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Upload your school logo in School Profile first, then try again.",
+            )
+        updates["use_school_logo"] = body.use_school_logo
     if body.education_board is not None:
         updates["board"] = body.education_board.strip() or None
     if body.established_date is not None:
@@ -656,7 +670,7 @@ async def all_school_stats(
     client = get_client()
     schools_res = (
         await client.table("schools")
-        .select("id,school_name,institution_code,is_active,is_trial,city,state")
+        .select("id,school_name,institution_code,is_active,is_trial,city,state,subscription_plan")
         .order("school_name")
         .limit(1000)
         .execute()
@@ -706,8 +720,83 @@ async def all_school_stats(
             student_count=c["student"],
             teacher_count=c["teacher"],
             staff_count=c["staff"],
+            subscription_plan=s.get("subscription_plan"),
         ))
     return results
+
+
+@router.get("/payment-overview")
+async def payment_overview(
+    user: dict = Depends(require_roles("developer")),
+) -> dict:
+    """Developer-only: payment/subscription overview across all schools."""
+    client = get_client()
+    schools_res = (
+        await client.table("schools")
+        .select("id,school_name,institution_code,is_active,is_trial,subscription_plan,city,state")
+        .order("school_name")
+        .limit(1000)
+        .execute()
+    )
+    schools = schools_res.data or []
+    if not schools:
+        return {"schools": [], "total_revenue": 0, "total_paid": 0, "total_pending": 0}
+
+    school_ids = [s["id"] for s in schools]
+
+    # Fee payment totals per school
+    payments_res = (
+        await client.table("fee_payments")
+        .select("school_id,payment_status,total")
+        .in_("school_id", school_ids)
+        .execute()
+    )
+    pay_stats: dict[str, dict] = {}
+    for row in payments_res.data or []:
+        sid = row.get("school_id")
+        if not sid:
+            continue
+        if sid not in pay_stats:
+            pay_stats[sid] = {"revenue": 0, "paid_count": 0, "pending_count": 0}
+        ps = (row.get("payment_status") or "").lower()
+        total = float(row.get("total") or 0)
+        if ps == "paid":
+            pay_stats[sid]["revenue"] += total
+            pay_stats[sid]["paid_count"] += 1
+        elif ps in ("created", "pending"):
+            pay_stats[sid]["pending_count"] += 1
+
+    schools_out = []
+    total_revenue = 0.0
+    total_paid = 0
+    total_pending = 0
+    for s in schools:
+        sid = s["id"]
+        ps = pay_stats.get(sid, {"revenue": 0, "paid_count": 0, "pending_count": 0})
+        revenue = round(ps["revenue"], 2)
+        total_revenue += revenue
+        total_paid += ps["paid_count"]
+        total_pending += ps["pending_count"]
+        schools_out.append({
+            "id": sid,
+            "school_name": s.get("school_name") or "",
+            "institution_code": s.get("institution_code") or "",
+            "is_active": s.get("is_active", True),
+            "is_trial": s.get("is_trial", False),
+            "subscription_plan": s.get("subscription_plan") or "free",
+            "city": s.get("city"),
+            "state": s.get("state"),
+            "revenue": revenue,
+            "paid_count": ps["paid_count"],
+            "pending_count": ps["pending_count"],
+        })
+
+    return {
+        "schools": schools_out,
+        "total_revenue": round(total_revenue, 2),
+        "total_paid": total_paid,
+        "total_pending": total_pending,
+    }
 
 
 @router.post("/search", response_model=List[SchoolSearchResult])

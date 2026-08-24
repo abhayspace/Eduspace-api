@@ -98,6 +98,15 @@ async def list_teachers(
     return await teacher_service.list_teachers(user["school_id"])
 
 
+@router.get("/by-user/{user_id}", response_model=TeacherOut)
+async def get_teacher_by_user(
+    user_id: str,
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
+) -> TeacherOut:
+    """Look up a teacher by their user_id (used by calendar birthday navigation)."""
+    return await teacher_service.get_teacher_by_user_id(user["school_id"], user_id)
+
+
 @router.get("/{teacher_id}", response_model=TeacherOut)
 async def get_teacher(
     teacher_id: str,

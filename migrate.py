@@ -77,6 +77,8 @@ MIGRATION_ORDER = [
     "062_developer_user.sql",
     "063_help_chat.sql",
     "064_developer_notes.sql",
+    "065_app_display_name.sql",
+    "066_feed_posting_restrictions.sql",
 ]
 
 

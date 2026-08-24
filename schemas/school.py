@@ -106,7 +106,9 @@ class SchoolBrandOut(BaseModel):
     """Public school branding available to any authenticated member of the school."""
 
     school_name: str = Field(alias="schoolName")
+    app_display_name: Optional[str] = Field(default=None, alias="appDisplayName")
     logo_url: Optional[str] = Field(default=None, alias="logoUrl")
+    use_school_logo: bool = Field(default=False, alias="useSchoolLogo")
     school_email: Optional[str] = Field(default=None, alias="schoolEmail")
     school_phone: Optional[str] = Field(default=None, alias="schoolPhone")
     address: Optional[str] = None
@@ -146,6 +148,8 @@ class SchoolProfileOut(BaseModel):
 class SchoolProfileUpdateIn(BaseModel):
     """Editable school profile fields. Email changes require OTP verification."""
 
+    app_display_name: Optional[str] = Field(default=None, alias="appDisplayName")
+    use_school_logo: Optional[bool] = Field(default=None, alias="useSchoolLogo")
     education_board: Optional[str] = Field(default=None, alias="educationBoard")
     established_date: Optional[str] = Field(default=None, alias="establishedDate")
     school_email: Optional[EmailStr] = Field(default=None, alias="schoolEmail")
@@ -197,5 +201,6 @@ class SchoolStatsOut(BaseModel):
     student_count: int = Field(default=0, alias="studentCount")
     teacher_count: int = Field(default=0, alias="teacherCount")
     staff_count: int = Field(default=0, alias="staffCount")
+    subscription_plan: Optional[str] = Field(default=None, alias="subscriptionPlan")
 
     model_config = {"populate_by_name": True}

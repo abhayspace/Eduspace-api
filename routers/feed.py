@@ -7,15 +7,21 @@ from fastapi.responses import FileResponse
 from schemas.feed import (
     FeedCommentCreateIn,
     FeedCommentOut,
+    FeedCommentUpdateIn,
     FeedLikeOut,
     FeedPostCreateIn,
     FeedPostOut,
+    FeedPostUpdateIn,
+    FeedRestrictionIn,
+    FeedRestrictionOut,
 )
 from services import feed_service
 from services.feed_media_service import resolve_feed_file
-from utils.deps import current_user
+from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/feed", tags=["feed"])
+
+_admin_dep = require_roles("school_admin", "principal", "vice_principal", "super_admin")
 
 
 @router.post("/upload-media")
@@ -49,6 +55,33 @@ async def delete_post(
     user: dict = Depends(current_user),
 ) -> Response:
     await feed_service.delete_post(user["school_id"], post_id, user)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put("/{post_id}", response_model=FeedPostOut)
+async def update_post(
+    post_id: str,
+    body: FeedPostUpdateIn,
+    user: dict = Depends(current_user),
+) -> FeedPostOut:
+    return await feed_service.update_post(user["school_id"], post_id, user, body)
+
+
+@router.post("/restrictions/{user_id}", response_model=FeedRestrictionOut)
+async def restrict_author(
+    user_id: str,
+    body: FeedRestrictionIn,
+    user: dict = Depends(_admin_dep),
+) -> FeedRestrictionOut:
+    return await feed_service.restrict_author(user["school_id"], user_id, user, body.reason)
+
+
+@router.delete("/restrictions/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def unrestrict_author(
+    user_id: str,
+    user: dict = Depends(_admin_dep),
+) -> Response:
+    await feed_service.unrestrict_author(user["school_id"], user_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -88,6 +121,15 @@ async def delete_comment(
 ) -> Response:
     await feed_service.delete_comment(user["school_id"], comment_id, user)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put("/comments/{comment_id}", response_model=FeedCommentOut)
+async def update_comment(
+    comment_id: str,
+    body: FeedCommentUpdateIn,
+    user: dict = Depends(current_user),
+) -> FeedCommentOut:
+    return await feed_service.update_comment(user["school_id"], comment_id, user, body)
 
 
 @router.get("/files/{filename}")

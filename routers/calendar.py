@@ -38,7 +38,7 @@ async def get_month(
     year: int,
     user: dict = Depends(current_user),
 ) -> CalendarMonthOut:
-    return await calendar_service.list_month(user["school_id"], month, year)
+    return await calendar_service.list_month(user["school_id"], month, year, user)
 
 
 @router.post("/events", response_model=CalendarEventOut)

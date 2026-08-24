@@ -227,3 +227,18 @@ async def my_staff_attendance_summary(
         month=month,
         year=year,
     )
+
+
+@router.get("/my-student-summary", response_model=StaffAttendanceSummaryOut)
+async def my_student_attendance_summary(
+    user: dict = Depends(require_roles("student")),
+    view: str = Query("monthly", description="monthly or yearly"),
+    month: Optional[int] = Query(None, ge=1, le=12),
+    year: Optional[int] = Query(None, ge=1970, le=2100),
+) -> StaffAttendanceSummaryOut:
+    return await staff_attendance_service.my_student_attendance_summary(
+        user,
+        view=view,
+        month=month,
+        year=year,
+    )
