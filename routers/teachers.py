@@ -93,7 +93,7 @@ async def get_teacher_document(
 
 @router.get("", response_model=List[TeacherOut])
 async def list_teachers(
-    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "teacher")),
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "office_staff", "super_admin", "teacher")),
 ) -> List[TeacherOut]:
     return await teacher_service.list_teachers(user["school_id"])
 
