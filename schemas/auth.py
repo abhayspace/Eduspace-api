@@ -11,7 +11,8 @@ class UserPublic(BaseModel):
     # which EmailStr rejects (.local is not a valid TLD).  Email validation
     # belongs on input schemas (RegisterIn, LoginIn, LinkEmailIn), not on
     # this response model that returns data already stored in the DB.
-    email: str
+    # Optional because some legacy/migrated student rows may have NULL email.
+    email: Optional[str] = None
     full_name: str
     role: str
     school_id: Optional[str] = None

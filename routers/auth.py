@@ -221,10 +221,20 @@ async def login(body: LoginIn) -> TokenOut:
     if body.role and not is_school_portal_login and user.get("role") != body.role:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Role does not match this account")
 
-    token = create_access_token(
-        user_id=user["id"], role=user["role"], email=user["email"], school_id=user["school_id"]
-    )
-    return TokenOut(access_token=token, user=await _to_public_enriched(user))
+    try:
+        token = create_access_token(
+            user_id=user["id"], role=user["role"], email=user["email"], school_id=user["school_id"]
+        )
+        enriched = await _to_public_enriched(user)
+        return TokenOut(access_token=token, user=enriched)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "Login succeeded for user_id=%s role=%s email=%r but response building failed: %s",
+            user.get("id"), user.get("role"), user.get("email"), exc,
+        )
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Login failed while building response. Check server logs.")
 
 
 @router.post("/register", response_model=UserPublic)
