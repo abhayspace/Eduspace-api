@@ -79,6 +79,15 @@ MIGRATION_ORDER = [
     "064_developer_notes.sql",
     "065_app_display_name.sql",
     "066_feed_posting_restrictions.sql",
+    "067_quizzes_and_forms.sql",
+    "068_complaints_and_behaviour.sql",
+    "069_transport_management.sql",
+    "070_library_dues.sql",
+    "071_study_materials.sql",
+    "072_student_fees_enhancements.sql",
+    "073_force_update.sql",
+    "074_leave_requests_reviewer.sql",
+    "075_messages_reply_to_id.sql",
 ]
 
 
