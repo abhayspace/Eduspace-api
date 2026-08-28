@@ -6,7 +6,12 @@ from pydantic import BaseModel, EmailStr, Field
 
 class UserPublic(BaseModel):
     id: str
-    email: EmailStr
+    # email is a plain str (not EmailStr) because students created without a
+    # real email get a placeholder like "student_0001_xxx@eduspace.local",
+    # which EmailStr rejects (.local is not a valid TLD).  Email validation
+    # belongs on input schemas (RegisterIn, LoginIn, LinkEmailIn), not on
+    # this response model that returns data already stored in the DB.
+    email: str
     full_name: str
     role: str
     school_id: Optional[str] = None

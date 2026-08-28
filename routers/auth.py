@@ -164,7 +164,17 @@ async def login(body: LoginIn) -> TokenOut:
             query = query.eq("role", body.role)
         res = await query.limit(1).execute()
         user = res.data[0] if res.data else None
-        if not user or not verify_password(body.password, user.get("password_hash", "")):
+        if not user:
+            logger.warning(
+                "Login failed: user not found. identifier=%r school_id=%r role=%r or_parts=%r",
+                ident, body.school_id, body.role, or_parts,
+            )
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+        if not verify_password(body.password, user.get("password_hash", "")):
+            logger.warning(
+                "Login failed: password mismatch for user_id=%s identifier=%r role=%s",
+                user.get("id"), ident, user.get("role"),
+            )
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
     elif body.email:
         res = (
