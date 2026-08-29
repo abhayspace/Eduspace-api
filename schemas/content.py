@@ -426,6 +426,18 @@ class NotificationItem(BaseModel):
     created_at: datetime = Field(default_factory=_now)
 
 
+class NotificationFeedItem(BaseModel):
+    id: str
+    type: str  # announcement, form, quiz, appointment, fee, notification
+    title: str
+    body: str = ""
+    icon: str = "bell"  # icon name for frontend
+    route: Optional[str] = None  # deep link route
+    is_read: bool = False
+    created_at: datetime
+    metadata: Optional[dict] = None  # extra context (due_date, amount, etc.)
+
+
 class SchoolTimingOut(BaseModel):
     start_time: str = ""
     start_meridiem: str = "AM"

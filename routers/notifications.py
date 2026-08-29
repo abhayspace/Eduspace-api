@@ -4,7 +4,8 @@ from typing import List
 from fastapi import APIRouter, Depends, status
 
 from database import get_client
-from schemas.content import NotificationItem, RegisterPushIn
+from schemas.content import NotificationFeedItem, NotificationItem, RegisterPushIn
+from services.notification_feed_service import get_notification_feed
 from services.notification_service import register_device
 from utils.deps import current_user
 
@@ -33,3 +34,10 @@ async def list_notifications(user: dict = Depends(current_user)) -> List[Notific
         .execute()
     )
     return [NotificationItem(**row) for row in (res.data or [])]
+
+
+@router.get("/notifications/feed", response_model=List[NotificationFeedItem])
+async def notification_feed(user: dict = Depends(current_user)) -> List[NotificationFeedItem]:
+    """Unified notification feed aggregating announcements, forms, quizzes,
+    appointments/PTM, fees due, and push notifications."""
+    return await get_notification_feed(user["school_id"], user)
