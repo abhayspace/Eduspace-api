@@ -14,7 +14,7 @@ from schemas.eddy import EddyChatIn, EddyChatMessage
 logger = logging.getLogger("eduspace.eddy")
 
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 
 STYLE_GUIDE = {
     "professional": "Respond in a clear, professional tone suitable for school staff.",
@@ -79,8 +79,8 @@ def _require_groq() -> tuple[str, str]:
     return api_key, model
 
 
-def _raise_for_status(status_code: int, detail: str) -> None:
-    logger.warning("Eddy Groq error %s: %s", status_code, detail)
+def _raise_for_status(status_code: int, detail: str, model: str = "") -> None:
+    logger.warning("Eddy Groq error %s: %s (model=%s)", status_code, detail, model)
     if status_code in (401, 403):
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
@@ -90,6 +90,11 @@ def _raise_for_status(status_code: int, detail: str) -> None:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "Eddy is busy right now (Groq rate limit). Wait a minute and try again.",
+        )
+    if status_code == 404:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"Eddy AI model '{model}' was not found (404). It may be deprecated. Update GROQ_MODEL.",
         )
     raise HTTPException(
         status.HTTP_502_BAD_GATEWAY,
@@ -136,7 +141,7 @@ async def generate_reply(body: EddyChatIn, user: dict) -> tuple[str, str]:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Could not reach Eddy AI.") from exc
 
     if res.status_code >= 400:
-        _raise_for_status(res.status_code, res.text[:400])
+        _raise_for_status(res.status_code, res.text[:400], model)
 
     return _extract_text(res.json()), model
 
@@ -165,7 +170,7 @@ async def stream_reply(body: EddyChatIn, user: dict) -> AsyncIterator[str]:
         ) as res:
             if res.status_code >= 400:
                 text = (await res.aread()).decode("utf-8", errors="replace")[:400]
-                _raise_for_status(res.status_code, text)
+                _raise_for_status(res.status_code, text, model)
             async for line in res.aiter_lines():
                 if not line or not line.startswith("data:"):
                     continue

@@ -7,13 +7,25 @@ import logging
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
+from config import get_settings
 from schemas.eddy import EddyChatIn, EddyChatOut
-from services.eddy_service import generate_reply, stream_reply
+from services.eddy_service import DEFAULT_GROQ_MODEL, generate_reply, stream_reply
 from utils.deps import current_user
 
 router = APIRouter(prefix="/eddy", tags=["eddy"])
 public_router = APIRouter(prefix="/eddy", tags=["eddy"])
 logger = logging.getLogger("eduspace.eddy")
+
+
+@router.get("/debug")
+async def eddy_debug(user: dict = Depends(current_user)) -> dict:
+    """Diagnostic: shows which Groq model Eddy will use."""
+    settings = get_settings()
+    return {
+        "configured_model": settings.groq_model,
+        "code_default": DEFAULT_GROQ_MODEL,
+        "api_key_set": bool((settings.groq_api_key or "").strip()),
+    }
 
 
 @router.post("/chat", response_model=EddyChatOut)

@@ -875,3 +875,43 @@ async def trial_stop_route(user: dict = Depends(require_roles("school_admin"))) 
 async def trial_check_expired_route() -> dict:
     count = await check_and_expire_trials()
     return {"expired_count": count}
+
+
+# ---------------------------------------------------------------------------
+# Force-update flag (developer-only)
+# ---------------------------------------------------------------------------
+
+@router.get("/force-update")
+async def get_force_update(
+    user: dict = Depends(current_user),
+) -> dict:
+    """Return the current force-update flag + message. Available to all logged-in users."""
+    client = get_client()
+    res = (
+        await client.table("app_force_update")
+        .select("force_update,message,updated_at")
+        .eq("id", 1)
+        .limit(1)
+        .execute()
+    )
+    row = (res.data or [{}])[0]
+    return {
+        "force_update": bool(row.get("force_update")),
+        "message": row.get("message"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+@router.post("/force-update")
+async def set_force_update(
+    body: dict,
+    user: dict = Depends(require_roles("developer")),
+) -> dict:
+    """Developer-only: toggle the force-update flag."""
+    client = get_client()
+    force_update = bool(body.get("force_update", False))
+    message = (body.get("message") or "").strip() or None
+    await client.table("app_force_update").upsert(
+        {"id": 1, "force_update": force_update, "message": message, "updated_at": "now()"},
+    ).execute()
+    return {"force_update": force_update, "message": message}

@@ -79,7 +79,7 @@ async def get_student_document(
 
 
 def _strip_password_for_teacher(student: StudentOut, user: dict) -> StudentOut:
-    if user.get("role") == "teacher":
+    if user.get("role") in ("teacher", "student"):
         return student.model_copy(update={"login_password": None})
     return student
 
@@ -150,10 +150,17 @@ async def list_students(
     class_id: Optional[str] = None,
     section_id: Optional[str] = None,
     search: Optional[str] = None,
-    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "teacher")),
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "teacher", "student")),
 ) -> List[StudentOut]:
+    school_id = user["school_id"]
+    # Students may only view their own classmates.
+    if user.get("role") == "student":
+        me = await student_service.get_student_by_user_id(school_id, user["id"])
+        class_id = me.class_id
+        section_id = me.section_id
+        search = None
     rows = await student_service.list_students(
-        user["school_id"],
+        school_id,
         class_id,
         section_id,
         search,

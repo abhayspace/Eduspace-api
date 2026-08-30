@@ -2,7 +2,7 @@
 from datetime import date, datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from database import get_client
 from schemas.content import (
@@ -14,7 +14,13 @@ from schemas.content import (
     StudentFeeDueIn,
     StudentFeeMarkPaidIn,
 )
-from services import fee_structure_service, student_service
+from schemas.student_fees import (
+    FeeDiscountIn,
+    FeeDiscountOut,
+    FeeNoticeIn,
+    FeeNoticeOut,
+)
+from services import fee_structure_service, student_fees_service, student_service
 from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/fees", tags=["fees"])
@@ -852,3 +858,60 @@ async def pay_fee(fee_id: str, user: dict = Depends(current_user)) -> dict:
         .execute()
     )
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Fee discounts / scholarships / concessions (admin CRUD)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/discounts", response_model=List[FeeDiscountOut])
+async def list_fee_discounts(
+    student_id: Optional[str] = Query(default=None),
+    user: dict = Depends(_FEE_ADMIN),
+) -> List[FeeDiscountOut]:
+    return await student_fees_service.list_fee_discounts(user["school_id"], student_id)
+
+
+@router.post("/discounts", response_model=FeeDiscountOut)
+async def create_fee_discount(
+    body: FeeDiscountIn,
+    user: dict = Depends(_FEE_ADMIN),
+) -> FeeDiscountOut:
+    return await student_fees_service.create_fee_discount(user["school_id"], user["id"], body)
+
+
+@router.delete("/discounts/{discount_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_fee_discount(
+    discount_id: str,
+    user: dict = Depends(_FEE_ADMIN),
+) -> Response:
+    await student_fees_service.delete_fee_discount(user["school_id"], discount_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Fee notices (admin CRUD)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/notices", response_model=List[FeeNoticeOut])
+async def list_fee_notices(user: dict = Depends(_FEE_ADMIN)) -> List[FeeNoticeOut]:
+    return await student_fees_service.list_fee_notices(user["school_id"])
+
+
+@router.post("/notices", response_model=FeeNoticeOut)
+async def create_fee_notice(
+    body: FeeNoticeIn,
+    user: dict = Depends(_FEE_ADMIN),
+) -> FeeNoticeOut:
+    return await student_fees_service.create_fee_notice(user["school_id"], user["id"], body)
+
+
+@router.delete("/notices/{notice_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_fee_notice(
+    notice_id: str,
+    user: dict = Depends(_FEE_ADMIN),
+) -> Response:
+    await student_fees_service.delete_fee_notice(user["school_id"], notice_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

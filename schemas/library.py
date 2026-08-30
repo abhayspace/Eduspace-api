@@ -109,3 +109,27 @@ class LibrarySchoolStatsOut(BaseModel):
     total_books: int
     total_requests: int
     current_issued: int
+
+
+class LibraryDueRecordIn(BaseModel):
+    user_id: str
+    record_type: Literal["fine", "deposit"]
+    amount: float
+    note: str = ""
+    recorded_at: date
+
+
+class LibraryDueRecordOut(BaseModel):
+    id: str
+    user_id: str
+    record_type: Literal["fine", "deposit"]
+    amount: float
+    note: str
+    recorded_at: date
+    created_at: datetime
+    created_by: str
+
+
+class LibraryDuesOut(BaseModel):
+    total_due: float
+    records: List[LibraryDueRecordOut]

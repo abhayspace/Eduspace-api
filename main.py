@@ -24,12 +24,14 @@ from routers import (
     attendance,
     auth,
     calendar,
+    complaints_behaviour,
     dev_message,
     eddy,
     examinations,
     expenses,
     fees,
     feed,
+    forms,
     forgot,
     gallery,
     help,
@@ -42,6 +44,7 @@ from routers import (
     notifications,
     otp,
     parents,
+    quiz,
     payment_gateway,
     receipts,
     results,
@@ -50,10 +53,12 @@ from routers import (
     staff,
     students,
     student_settings,
+    study_material,
     support,
     syllabus,
     teachers,
     timetable,
+    transport,
 )
 
 settings = get_settings()
@@ -119,12 +124,17 @@ ROUTERS = [
     results.router,
     achievements.router,
     feed.router,
+    forms.router,
     help.router,
     notifications.router,
     messages.router,
     notes.router,
+    quiz.router,
     eddy.router,
     eddy.public_router,
+    complaints_behaviour.router,
+    transport.router,
+    study_material.router,
 ]
 for r in ROUTERS:
     app.include_router(r, prefix="/api")

@@ -16,6 +16,7 @@ from schemas.people import (
     TeacherOut,
     TeacherUpdateIn,
 )
+from services import student_service
 from services import teacher_service
 from services.teacher_document_service import (
     delete_teacher_document,
@@ -93,9 +94,19 @@ async def get_teacher_document(
 
 @router.get("", response_model=List[TeacherOut])
 async def list_teachers(
-    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "office_staff", "super_admin", "teacher")),
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "office_staff", "super_admin", "teacher", "student")),
 ) -> List[TeacherOut]:
-    return await teacher_service.list_teachers(user["school_id"])
+    rows = await teacher_service.list_teachers(user["school_id"])
+    # Students may only see teachers assigned to their class/section.
+    if user.get("role") == "student":
+        members = await student_service.get_my_class_group_members(user["school_id"], user["id"])
+        allowed = set(members.get("member_user_ids") or [])
+        rows = [
+            r.model_copy(update={"login_password": None})
+            for r in rows
+            if r.user_id in allowed
+        ]
+    return rows
 
 
 @router.get("/by-user/{user_id}", response_model=TeacherOut)

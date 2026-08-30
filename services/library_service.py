@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 from fastapi import HTTPException, status
 
@@ -11,6 +11,9 @@ from schemas.library import (
     LibraryBookDetailOut,
     LibraryBookSummaryOut,
     LibraryCategoryOut,
+    LibraryDuesOut,
+    LibraryDueRecordIn,
+    LibraryDueRecordOut,
     LibraryFilter,
     LibraryHistoryItemOut,
     LibraryIssueOut,
@@ -740,4 +743,68 @@ async def get_school_stats(school_id: str) -> LibrarySchoolStatsOut:
         total_books=total_books,
         total_requests=total_requests,
         current_issued=current_issued,
+    )
+
+
+DUE_RECORD_COLUMNS = "id,school_id,user_id,record_type,amount,note,recorded_at,created_by,created_at"
+
+
+async def create_due_record(
+    school_id: str,
+    created_by: str,
+    body: LibraryDueRecordIn,
+) -> LibraryDueRecordOut:
+    client = get_client()
+    res = (
+        await client.table("library_due_records")
+        .insert({
+            "school_id": school_id,
+            "user_id": body.user_id,
+            "record_type": body.record_type,
+            "amount": body.amount,
+            "note": body.note,
+            "recorded_at": body.recorded_at.isoformat(),
+            "created_by": created_by,
+        })
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Could not create due record")
+    return _build_due_record_out(res.data[0])
+
+
+async def list_user_due_records(school_id: str, user_id: str, limit: int = 5) -> LibraryDuesOut:
+    client = get_client()
+    res = (
+        await client.table("library_due_records")
+        .select(DUE_RECORD_COLUMNS)
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .order("recorded_at", desc=True)
+        .order("created_at", desc=True)
+        .limit(500)
+        .execute()
+    )
+    rows = res.data or []
+    total_fines = sum(
+        float(r.get("amount") or 0) for r in rows if r.get("record_type") == "fine"
+    )
+    total_deposits = sum(
+        float(r.get("amount") or 0) for r in rows if r.get("record_type") == "deposit"
+    )
+    total_due = max(0.0, total_fines - total_deposits)
+    records = [_build_due_record_out(r) for r in rows[:limit]]
+    return LibraryDuesOut(total_due=round(total_due, 2), records=records)
+
+
+def _build_due_record_out(row: dict) -> LibraryDueRecordOut:
+    return LibraryDueRecordOut(
+        id=row["id"],
+        user_id=row["user_id"],
+        record_type=row["record_type"],
+        amount=float(row.get("amount") or 0),
+        note=row.get("note") or "",
+        recorded_at=_parse_date(row.get("recorded_at")) or date.today(),
+        created_at=_parse_datetime(row.get("created_at")) or datetime.now(timezone.utc),
+        created_by=row.get("created_by") or "",
     )

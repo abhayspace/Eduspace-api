@@ -34,6 +34,8 @@ def _out(row: dict) -> LeaveRequestOut:
         reviewed_by_user_id=row.get("reviewed_by_user_id"),
         reviewed_at=row.get("reviewed_at"),
         created_at=row.get("created_at"),
+        reviewer_user_id=row.get("reviewer_user_id"),
+        reviewer_role=row.get("reviewer_role") or "admin",
     )
 
 
@@ -59,6 +61,57 @@ async def _purge_expired(school_id: str) -> None:
     await client.table(TABLE).delete().eq("school_id", school_id).lt("created_at", cutoff).execute()
 
 
+async def _find_class_teacher_user_id(school_id: str, student_user_id: str) -> str | None:
+    """Find the class teacher's user_id for a given student."""
+    client = get_client()
+    # Get the student's class_id and section_id
+    stu_res = (
+        await client.table("students")
+        .select("class_id,section_id")
+        .eq("school_id", school_id)
+        .eq("user_id", student_user_id)
+        .limit(1)
+        .execute()
+    )
+    if not stu_res.data:
+        return None
+    profile = stu_res.data[0]
+    class_id = profile.get("class_id")
+    section_id = profile.get("section_id")
+    if not class_id or not section_id:
+        return None
+    # Find the class teacher assigned to this class+section
+    ct_res = (
+        await client.table("teachers")
+        .select("user_id")
+        .eq("school_id", school_id)
+        .eq("is_class_teacher", True)
+        .eq("class_teacher_class_id", class_id)
+        .eq("class_teacher_section_id", section_id)
+        .limit(1)
+        .execute()
+    )
+    if not ct_res.data:
+        return None
+    return ct_res.data[0].get("user_id")
+
+
+async def _is_class_teacher(user: dict) -> bool:
+    """Check if the current user is a class teacher."""
+    if user.get("role") != "teacher":
+        return False
+    client = get_client()
+    res = (
+        await client.table("teachers")
+        .select("is_class_teacher")
+        .eq("school_id", user["school_id"])
+        .eq("user_id", user["id"])
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data and res.data[0].get("is_class_teacher"))
+
+
 def _is_active(row: dict, today: date | None = None) -> bool:
     """A request is 'active' if its end_date has not yet passed."""
     anchor = today or date.today()
@@ -75,7 +128,30 @@ async def list_leave_requests(school_id: str, user: dict) -> List[LeaveRequestOu
     await _purge_expired(school_id)
     client = get_client()
     query = client.table(TABLE).select("*").eq("school_id", school_id)
-    if user["role"] not in REVIEWER_ROLES:
+    role = user["role"]
+    if role in REVIEWER_ROLES:
+        # Admins see teacher/staff requests (reviewer_role='admin')
+        query = query.eq("reviewer_role", "admin")
+    elif role == "teacher" and await _is_class_teacher(user):
+        # Class teachers see student requests assigned to them
+        query = query.eq("reviewer_role", "class_teacher").eq("reviewer_user_id", user["id"])
+        # Also show their own requests
+        res = await query.order("created_at", desc=True).limit(500).execute()
+        own_res = (
+            await client.table(TABLE)
+            .select("*")
+            .eq("school_id", school_id)
+            .eq("user_id", user["id"])
+            .order("created_at", desc=True)
+            .limit(500)
+            .execute()
+        )
+        combined = {r["id"]: r for r in (res.data or [])}
+        for r in (own_res.data or []):
+            combined[r["id"]] = r
+        return [_out(row) for row in sorted(combined.values(), key=lambda r: r.get("created_at", ""), reverse=True)]
+    else:
+        # Students and regular teachers see only their own requests
         query = query.eq("user_id", user["id"])
     res = await query.order("created_at", desc=True).limit(500).execute()
     return [_out(row) for row in res.data or []]
@@ -87,7 +163,27 @@ async def list_leave_history(school_id: str, user: dict) -> List[LeaveRequestOut
     today_iso = date.today().isoformat()
     client = get_client()
     query = client.table(TABLE).select("*").eq("school_id", school_id).lt("end_date", today_iso)
-    if user["role"] not in REVIEWER_ROLES:
+    role = user["role"]
+    if role in REVIEWER_ROLES:
+        query = query.eq("reviewer_role", "admin")
+    elif role == "teacher" and await _is_class_teacher(user):
+        query = query.eq("reviewer_role", "class_teacher").eq("reviewer_user_id", user["id"])
+        res = await query.order("created_at", desc=True).limit(200).execute()
+        own_res = (
+            await client.table(TABLE)
+            .select("*")
+            .eq("school_id", school_id)
+            .lt("end_date", today_iso)
+            .eq("user_id", user["id"])
+            .order("created_at", desc=True)
+            .limit(200)
+            .execute()
+        )
+        combined = {r["id"]: r for r in (res.data or [])}
+        for r in (own_res.data or []):
+            combined[r["id"]] = r
+        return [_out(row) for row in sorted(combined.values(), key=lambda r: r.get("created_at", ""), reverse=True)]
+    else:
         query = query.eq("user_id", user["id"])
     res = await query.order("created_at", desc=True).limit(200).execute()
     return [_out(row) for row in res.data or []]
@@ -101,6 +197,15 @@ async def create_leave_request(school_id: str, user: dict, body: LeaveRequestIn)
     if body.leave_type == "multiple" and body.end_date < body.start_date:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "End date cannot be before start date")
     end_date = body.end_date if body.leave_type == "multiple" else body.start_date
+
+    # Route: student requests → class teacher, teacher/staff requests → admin
+    reviewer_role = "admin"
+    reviewer_user_id = None
+    if user["role"] == "student":
+        ct_id = await _find_class_teacher_user_id(school_id, user["id"])
+        if ct_id:
+            reviewer_role = "class_teacher"
+            reviewer_user_id = ct_id
 
     client = get_client()
     res = (
@@ -117,6 +222,8 @@ async def create_leave_request(school_id: str, user: dict, body: LeaveRequestIn)
                 "end_date": end_date.isoformat(),
                 "description": body.description.strip(),
                 "status": "pending",
+                "reviewer_role": reviewer_role,
+                "reviewer_user_id": reviewer_user_id,
             }
         )
         .execute()
@@ -192,6 +299,29 @@ async def decide_leave_request(
     school_id: str, user: dict, request_id: str, body: LeaveRequestDecisionIn
 ) -> LeaveRequestOut:
     row = await _row(school_id, request_id)
+    # Permission check: class teachers can only decide student requests
+    # assigned to them; admins can decide teacher/staff requests.
+    if user["role"] in REVIEWER_ROLES:
+        if row.get("reviewer_role") == "class_teacher":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Student leave requests are reviewed by the class teacher",
+            )
+    elif user["role"] == "teacher" and await _is_class_teacher(user):
+        if row.get("reviewer_role") != "class_teacher":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "You can only review leave requests from students in your class",
+            )
+        if row.get("reviewer_user_id") != user["id"]:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "This leave request is assigned to a different class teacher",
+            )
+    else:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "You do not have permission to review leave requests"
+        )
     client = get_client()
     res = (
         await client.table(TABLE)

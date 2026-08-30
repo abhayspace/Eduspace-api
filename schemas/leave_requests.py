@@ -30,6 +30,8 @@ class LeaveRequestOut(BaseModel):
     reviewed_by_user_id: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    reviewer_user_id: Optional[str] = None
+    reviewer_role: str = "admin"
 
 
 class LeaveRequestDecisionIn(BaseModel):

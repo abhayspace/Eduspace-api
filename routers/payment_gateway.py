@@ -7,7 +7,9 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Query, Request
 
 from schemas.payment import CreateFeeOrderIn, PaymentGatewayUpsertIn, VerifyFeePaymentIn
+from schemas.student_fees import FeeOverviewOut
 from services.payment import gateway_service, payment_service
+from services import student_fees_service
 from utils.deps import current_user, require_roles
 
 router = APIRouter(tags=["payment-gateway"])
@@ -111,6 +113,13 @@ async def student_fees_summary(user: dict = Depends(current_user)) -> dict:
         "discount": discount,
         "grand_total": grand_total,
     }
+
+
+@router.get("/student/fees/overview", response_model=FeeOverviewOut)
+async def student_fees_overview(user: dict = Depends(current_user)) -> FeeOverviewOut:
+    """Comprehensive fees overview for student/parent: totals, components,
+    payment history, discounts, and notices."""
+    return await student_fees_service.get_student_fees_overview(user)
 
 
 @router.post("/student/fees/create-order")

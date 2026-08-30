@@ -852,13 +852,24 @@ async def school_performance_options(
 async def school_performance(
     exam_name: str = Query(...),
     subject: str = Query(...),
+    class_names: Optional[str] = Query(None),
     user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
 ) -> dict:
-    """Class-level performance for one exam + subject across the whole school."""
+    """Class-level (or section-level) performance for one exam + subject.
+
+    ``class_names`` is a comma-separated list of class names.
+    - Empty/None → compare all classes (class-level bars).
+    - Single class → compare sections within that class.
+    - Multiple classes → compare those classes (class-level bars).
+    """
     client = get_client()
     school_id = user["school_id"]
     subject_key = subject.strip()
     exam_key = exam_name.strip()
+    selected_classes = [
+        c.strip() for c in (class_names or "").split(",") if c.strip()
+    ]
+    single_class = len(selected_classes) == 1
     if await _is_demo_performance_school(school_id):
         return _demo_teacher_performance(exam_key, subject_key)
 
@@ -878,15 +889,16 @@ async def school_performance(
     if not exam_key or not subject_key:
         return empty
 
-    exams = (
-        await client.table("examinations")
+    query = (
+        client.table("examinations")
         .select(_EXAM_COLUMNS)
         .eq("school_id", school_id)
         .eq("name", exam_key)
         .eq("subject", subject_key)
-        .limit(500)
-        .execute()
     )
+    if selected_classes:
+        query = query.in_("class_name", selected_classes)
+    exams = await query.limit(500).execute()
     exam_rows = exams.data or []
     if not exam_rows:
         return empty
@@ -906,24 +918,30 @@ async def school_performance(
     if not result_rows:
         return empty
 
-    class_pcts: Dict[str, List[float]] = defaultdict(list)
+    # Single class → group by section_name; multiple/no classes → group by class_name.
+    group_pcts: Dict[str, List[float]] = defaultdict(list)
     all_pcts: List[float] = []
     for row in result_rows:
         eid = row.get("examination_id") or ""
         exam = exam_by_id.get(eid) or {}
-        cls = (exam.get("class_name") or "—").strip() or "—"
+        if single_class:
+            section = (exam.get("section_name") or "—").strip() or "—"
+            group_key = section
+        else:
+            cls = (exam.get("class_name") or "—").strip() or "—"
+            group_key = cls
         max_marks = float(exam.get("max_marks") or 100) or 100
         marks = float(row.get("marks_obtained") or 0)
         pct = max(0.0, min(100.0, (marks / max_marks) * 100))
-        class_pcts[cls].append(pct)
+        group_pcts[group_key].append(pct)
         all_pcts.append(pct)
 
     class_bars = []
-    for cls, pcts in sorted(class_pcts.items(), key=lambda kv: kv[0].lower()):
+    for key, pcts in sorted(group_pcts.items(), key=lambda kv: kv[0].lower()):
         avg = sum(pcts) / len(pcts) if pcts else 0
         class_bars.append(
             {
-                "class_name": cls,
+                "class_name": key,
                 "average_pct": round(avg, 1),
                 "student_count": len(pcts),
                 "highest_pct": round(max(pcts), 1) if pcts else 0,
@@ -941,16 +959,17 @@ async def school_performance(
     lowest_score = round(min(all_pcts), 1) if all_pcts else 0
     gap = round(best["average_pct"] - lowest["average_pct"], 1)
 
+    group_label = "Section" if single_class else "Class"
     if best["class_name"] == lowest["class_name"]:
         insight = (
-            f"Class {best['class_name']} averaged {best['average_pct']}% in {subject_key}. "
+            f"{group_label} {best['class_name']} averaged {best['average_pct']}% in {subject_key}. "
             f"Overall average across evaluated students is {overall}%."
         )
     else:
         insight = (
-            f"Class {best['class_name']} achieved the highest average score "
-            f"({best['average_pct']}%). Class {lowest['class_name']} scored "
-            f"{gap}% lower than the top-performing class and may benefit from "
+            f"{group_label} {best['class_name']} achieved the highest average score "
+            f"({best['average_pct']}%). {group_label} {lowest['class_name']} scored "
+            f"{gap}% lower than the top-performing {group_label.lower()} and may benefit from "
             f"additional revision before the next assessment."
         )
 

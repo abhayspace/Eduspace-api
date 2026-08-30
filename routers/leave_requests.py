@@ -14,7 +14,8 @@ from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/leave-requests", tags=["leave-requests"])
 
-reviewer_only = require_roles("school_admin", "principal", "vice_principal")
+# Admins review teacher/staff requests; class teachers review student requests.
+reviewer_only = require_roles("school_admin", "principal", "vice_principal", "teacher")
 
 
 @router.get("", response_model=List[LeaveRequestOut])

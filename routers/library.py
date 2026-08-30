@@ -9,6 +9,9 @@ from schemas.library import (
     LibraryBookRequestIn,
     LibraryBookSummaryOut,
     LibraryCategoryOut,
+    LibraryDueRecordIn,
+    LibraryDueRecordOut,
+    LibraryDuesOut,
     LibraryFilter,
     LibraryHistoryItemOut,
     LibraryIssueOut,
@@ -18,7 +21,7 @@ from schemas.library import (
     LibrarySummaryOut,
 )
 from services import library_service
-from utils.deps import require_roles
+from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/library", tags=["library"])
 
@@ -156,3 +159,18 @@ async def remove_favorite(
 ) -> Response:
     await library_service.remove_favorite(user["school_id"], user["id"], book_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/due-records", response_model=LibraryDueRecordOut)
+async def create_due_record(
+    body: LibraryDueRecordIn,
+    user: dict = Depends(require_roles("teacher", "school_admin", "principal", "vice_principal")),
+) -> LibraryDueRecordOut:
+    """Librarian/teacher creates a fine or deposit record for a student."""
+    return await library_service.create_due_record(user["school_id"], user["id"], body)
+
+
+@router.get("/due-records/me", response_model=LibraryDuesOut)
+async def my_due_records(user: dict = Depends(current_user)) -> LibraryDuesOut:
+    """Student sees their total library due and recent fine/deposit records."""
+    return await library_service.list_user_due_records(user["school_id"], user["id"])
