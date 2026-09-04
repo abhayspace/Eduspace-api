@@ -92,7 +92,7 @@ async def _to_public_enriched(user: dict) -> UserPublic:
         try:
             school_res = (
                 await client.table("schools")
-                .select("is_trial,trial_status,trial_ends_at,access_blocked,payment_link,subscription_amount")
+                .select("is_trial,trial_status,trial_ends_at,access_blocked,payment_link,subscription_amount,plan_cancelled")
                 .eq("id", school_id)
                 .limit(1)
                 .execute()
@@ -109,7 +109,9 @@ async def _to_public_enriched(user: dict) -> UserPublic:
                 access_blocked = bool(school_row.get("access_blocked"))
                 payment_link = (school_row.get("payment_link") or "").strip()
                 sub_amount = float(school_row.get("subscription_amount") or 0)
+                plan_cancelled = bool(school_row.get("plan_cancelled"))
                 updates["access_blocked"] = access_blocked
+                updates["plan_cancelled"] = plan_cancelled
                 # Show popup only for school_admin when payment link is set
                 if payment_link and user.get("role") == "school_admin":
                     updates["subscription_popup"] = True

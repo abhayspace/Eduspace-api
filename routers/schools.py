@@ -805,7 +805,8 @@ async def payment_overview(
 
 _SUB_COLS = (
     "id,school_name,institution_code,city,state,is_active,is_trial,"
-    "subscription_plan,display_plan,actual_plan,subscription_amount,payment_link,access_blocked"
+    "subscription_plan,display_plan,actual_plan,subscription_amount,payment_link,access_blocked,"
+    "billing_cycle,subscription_start_date,subscription_end_date,plan_cancelled"
 )
 
 
@@ -838,6 +839,10 @@ async def subscription_management(
             "subscription_amount": float(s.get("subscription_amount") or 0),
             "payment_link": s.get("payment_link") or "",
             "access_blocked": bool(s.get("access_blocked")),
+            "billing_cycle": s.get("billing_cycle") or "monthly",
+            "subscription_start_date": s.get("subscription_start_date"),
+            "subscription_end_date": s.get("subscription_end_date"),
+            "plan_cancelled": bool(s.get("plan_cancelled")),
         })
     return {"schools": schools}
 
@@ -851,7 +856,8 @@ async def update_subscription(
     """Developer-only: update subscription fields for a school."""
     allowed_fields = {
         "display_plan", "actual_plan", "subscription_amount",
-        "payment_link", "access_blocked",
+        "payment_link", "access_blocked", "billing_cycle",
+        "subscription_start_date", "subscription_end_date",
     }
     updates = {k: v for k, v in body.items() if k in allowed_fields}
     if not updates:
@@ -886,6 +892,66 @@ async def mark_payment_done(
     if not res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
     return {"ok": True, "payment_link": None, "access_blocked": False}
+
+
+@router.post("/subscription-management/{school_id}/cancel-plan")
+async def cancel_plan(
+    school_id: str,
+    user: dict = Depends(require_roles("developer")),
+) -> dict:
+    """Developer-only: cancel a school's plan — blocks non-admin login, admin sees plan-selection popup."""
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .update({
+            "plan_cancelled": True,
+            "access_blocked": True,
+            "display_plan": None,
+            "actual_plan": None,
+            "subscription_plan": None,
+        })
+        .eq("id", school_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    return {"ok": True, "plan_cancelled": True}
+
+
+@router.get("/subscription-info")
+async def subscription_info(
+    user: dict = Depends(require_roles("school_admin")),
+) -> dict:
+    """Admin-only: get subscription details for their school."""
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select(
+            "display_plan,actual_plan,subscription_plan,subscription_amount,"
+            "billing_cycle,subscription_start_date,subscription_end_date,"
+            "payment_link,access_blocked,plan_cancelled"
+        )
+        .eq("id", school_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    s = res.data[0]
+    return {
+        "display_plan": s.get("display_plan") or s.get("subscription_plan") or "free",
+        "actual_plan": s.get("actual_plan") or s.get("subscription_plan") or "free",
+        "subscription_amount": float(s.get("subscription_amount") or 0),
+        "billing_cycle": s.get("billing_cycle") or "monthly",
+        "subscription_start_date": s.get("subscription_start_date"),
+        "subscription_end_date": s.get("subscription_end_date"),
+        "payment_link": s.get("payment_link") or "",
+        "access_blocked": bool(s.get("access_blocked")),
+        "plan_cancelled": bool(s.get("plan_cancelled")),
+    }
 
 
 @router.post("/search", response_model=List[SchoolSearchResult])

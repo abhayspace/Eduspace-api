@@ -37,6 +37,7 @@ class UserPublic(BaseModel):
     subscription_amount: Optional[float] = None
     payment_link: Optional[str] = None
     access_blocked: bool = False
+    plan_cancelled: bool = False
 
 
 class LoginIn(BaseModel):
