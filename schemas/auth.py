@@ -32,6 +32,11 @@ class UserPublic(BaseModel):
     is_trial: bool = False
     trial_expired: bool = False
     trial_status: Optional[str] = None
+    # Subscription payment popup
+    subscription_popup: bool = False
+    subscription_amount: Optional[float] = None
+    payment_link: Optional[str] = None
+    access_blocked: bool = False
 
 
 class LoginIn(BaseModel):

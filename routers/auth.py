@@ -85,14 +85,14 @@ async def _to_public_enriched(user: dict) -> UserPublic:
     if user.get("role") == "teacher":
         info = await teacher_service.get_user_class_teacher_info(user["school_id"], user["id"])
         updates.update(info)
-    # Check trial status
+    # Check trial status + subscription management
     school_id = user.get("school_id")
     if school_id:
         client = get_client()
         try:
             school_res = (
                 await client.table("schools")
-                .select("is_trial,trial_status,trial_ends_at")
+                .select("is_trial,trial_status,trial_ends_at,access_blocked,payment_link,subscription_amount")
                 .eq("id", school_id)
                 .limit(1)
                 .execute()
@@ -105,6 +105,16 @@ async def _to_public_enriched(user: dict) -> UserPublic:
                 updates["trial_status"] = trial_status
                 # Only show trial_expired blocking screen for school_admin
                 updates["trial_expired"] = is_trial and trial_status == "expired" and user.get("role") == "school_admin"
+                # Subscription access blocking
+                access_blocked = bool(school_row.get("access_blocked"))
+                payment_link = (school_row.get("payment_link") or "").strip()
+                sub_amount = float(school_row.get("subscription_amount") or 0)
+                updates["access_blocked"] = access_blocked
+                # Show popup if there is a payment link set by developer
+                if payment_link:
+                    updates["subscription_popup"] = True
+                    updates["subscription_amount"] = sub_amount
+                    updates["payment_link"] = payment_link
         except Exception:
             pass
     return base.model_copy(update=updates) if updates else base
@@ -220,6 +230,29 @@ async def login(body: LoginIn) -> TokenOut:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User does not belong to selected school")
     if body.role and not is_school_portal_login and user.get("role") != body.role:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Role does not match this account")
+
+    # Subscription access blocking — non-admin users cannot login
+    if user.get("role") not in ("school_admin", "developer"):
+        school_id = user.get("school_id")
+        if school_id:
+            try:
+                _client = get_client()
+                _school_res = (
+                    await _client.table("schools")
+                    .select("access_blocked")
+                    .eq("id", school_id)
+                    .limit(1)
+                    .execute()
+                )
+                if _school_res.data and _school_res.data[0].get("access_blocked"):
+                    raise HTTPException(
+                        status.HTTP_403_FORBIDDEN,
+                        "School access is currently suspended. Please contact your school administration."
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass
 
     try:
         token = create_access_token(

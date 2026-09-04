@@ -799,6 +799,95 @@ async def payment_overview(
     }
 
 
+# ---------------------------------------------------------------------------
+# Developer subscription management
+# ---------------------------------------------------------------------------
+
+_SUB_COLS = (
+    "id,school_name,institution_code,city,state,is_active,is_trial,"
+    "subscription_plan,display_plan,actual_plan,subscription_amount,payment_link,access_blocked"
+)
+
+
+@router.get("/subscription-management")
+async def subscription_management(
+    user: dict = Depends(require_roles("developer")),
+) -> dict:
+    """Developer-only: list all schools with subscription management fields."""
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select(_SUB_COLS)
+        .order("school_name")
+        .limit(1000)
+        .execute()
+    )
+    schools = []
+    for s in res.data or []:
+        schools.append({
+            "id": s["id"],
+            "school_name": s.get("school_name") or "",
+            "institution_code": s.get("institution_code") or "",
+            "city": s.get("city"),
+            "state": s.get("state"),
+            "is_active": s.get("is_active", True),
+            "is_trial": s.get("is_trial", False),
+            "subscription_plan": s.get("subscription_plan") or "free",
+            "display_plan": s.get("display_plan") or s.get("subscription_plan") or "free",
+            "actual_plan": s.get("actual_plan") or s.get("subscription_plan") or "free",
+            "subscription_amount": float(s.get("subscription_amount") or 0),
+            "payment_link": s.get("payment_link") or "",
+            "access_blocked": bool(s.get("access_blocked")),
+        })
+    return {"schools": schools}
+
+
+@router.patch("/subscription-management/{school_id}")
+async def update_subscription(
+    school_id: str,
+    body: dict,
+    user: dict = Depends(require_roles("developer")),
+) -> dict:
+    """Developer-only: update subscription fields for a school."""
+    allowed_fields = {
+        "display_plan", "actual_plan", "subscription_amount",
+        "payment_link", "access_blocked",
+    }
+    updates = {k: v for k, v in body.items() if k in allowed_fields}
+    if not updates:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No valid fields to update")
+
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .update(updates)
+        .eq("id", school_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+
+    return {"ok": True, **updates}
+
+
+@router.post("/subscription-management/{school_id}/payment-done")
+async def mark_payment_done(
+    school_id: str,
+    user: dict = Depends(require_roles("developer")),
+) -> dict:
+    """Developer-only: mark payment as done — clears payment_link and unblocks access."""
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .update({"payment_link": None, "access_blocked": False})
+        .eq("id", school_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+    return {"ok": True, "payment_link": None, "access_blocked": False}
+
+
 @router.post("/search", response_model=List[SchoolSearchResult])
 async def search_schools_route(body: SchoolSearchIn) -> List[SchoolSearchResult]:
     return await search_schools(body)
