@@ -43,6 +43,8 @@ async def try_admin_agent(school_id: str, message: str) -> Optional[str]:
             return await _answer_teacher_count(school_id, msg)
         if intent == "student_by_name":
             return await _answer_student_by_name(school_id, msg)
+        if intent == "student_by_letter":
+            return await _answer_student_by_letter(school_id, msg)
         if intent == "student_by_father":
             return await _answer_student_by_father(school_id, msg)
         if intent == "student_by_category":
@@ -64,7 +66,8 @@ async def try_admin_agent(school_id: str, message: str) -> Optional[str]:
 
 def _detect_intent(msg: str) -> Optional[str]:
     # Father name queries (check before generic student)
-    if any(k in msg for k in ["father name", "father's name", "whose father", "papa ka naam"]):
+    if any(k in msg for k in ["father name", "father's name", "whose father", "papa ka naam",
+                                "father is", "papa"]):
         return "student_by_father"
 
     # Category queries
@@ -72,6 +75,11 @@ def _detect_intent(msg: str) -> Optional[str]:
                                 "general student", "minor student",
                                 "obc category", "sc category", "st category"]):
         return "student_by_category"
+
+    # Name starts with letter
+    if any(k in msg for k in ["start from", "start with", "starts with", "starting with",
+                                "begin with", "begins with", "name from"]):
+        return "student_by_letter"
 
     # Student name search
     if any(k in msg for k in ["student named", "student name", "students named",
@@ -81,7 +89,7 @@ def _detect_intent(msg: str) -> Optional[str]:
 
     # Class strength
     if any(k in msg for k in ["class strength", "strength of class", "students in class",
-                                "how many in class", "class wise"]):
+                                "how many in class", "class wise", "classwise"]):
         return "class_strength"
 
     # Student count
@@ -185,39 +193,42 @@ async def _load_teachers(school_id: str):
 # Answer builders
 # ===================================================================
 
+def _wants_only_total(msg: str) -> bool:
+    short = ["how many", "total", "count", "kitne"]
+    detail = ["breakdown", "category", "class wise", "classwise", "gender", "detail", "list"]
+    return any(k in msg for k in short) and not any(k in msg for k in detail)
+
+
 async def _answer_student_count(school_id: str, msg: str) -> str:
     students = await _load_students(school_id)
     total = len(students)
     active = sum(1 for s in students if s["active"])
 
+    if _wants_only_total(msg):
+        return f"Your school has {total} students ({active} active)."
+
     cats = _count_by(students, "category")
     genders = _count_by(students, "gender")
     classes = _count_by(students, "class")
 
-    lines = [
-        f"## Students in Your School",
-        f"",
-        f"**Total Students:** {total}",
-        f"**Active:** {active}",
-        f"",
-    ]
+    lines = [f"Your school has {total} students ({active} active).\n"]
 
     if genders:
-        lines.append("### Gender Breakdown")
+        lines.append("Gender-wise:")
         for k, v in sorted(genders.items()):
-            lines.append(f"- **{k or 'Unknown'}:** {v}")
+            lines.append(f"- {k or 'Unknown'}: {v}")
         lines.append("")
 
     if cats:
-        lines.append("### Category Breakdown")
+        lines.append("Category-wise:")
         for k, v in sorted(cats.items()):
-            lines.append(f"- **{k or 'Unknown'}:** {v}")
+            lines.append(f"- {k or 'Unknown'}: {v}")
         lines.append("")
 
     if classes:
-        lines.append("### Class-wise Strength")
+        lines.append("Class-wise:")
         for k, v in sorted(classes.items()):
-            lines.append(f"- **{k or 'Unknown'}:** {v}")
+            lines.append(f"- {k or 'Unknown'}: {v}")
 
     return "\n".join(lines)
 
@@ -227,23 +238,20 @@ async def _answer_teacher_count(school_id: str, msg: str) -> str:
     total = len(teachers)
     active = sum(1 for t in teachers if t.get("is_active", True))
 
+    if _wants_only_total(msg):
+        return f"Your school has {total} teachers/staff ({active} active)."
+
     genders: Dict[str, int] = {}
     for t in teachers:
         g = t.get("gender") or "Unknown"
         genders[g] = genders.get(g, 0) + 1
 
-    lines = [
-        f"## Teachers / Staff in Your School",
-        f"",
-        f"**Total Teachers:** {total}",
-        f"**Active:** {active}",
-        f"",
-    ]
+    lines = [f"Your school has {total} teachers/staff ({active} active).\n"]
 
     if genders:
-        lines.append("### Gender Breakdown")
+        lines.append("Gender-wise:")
         for k, v in sorted(genders.items()):
-            lines.append(f"- **{k or 'Unknown'}:** {v}")
+            lines.append(f"- {k or 'Unknown'}: {v}")
 
     return "\n".join(lines)
 
@@ -257,13 +265,33 @@ async def _answer_student_by_name(school_id: str, msg: str) -> str:
     matches = [s for s in students if name_q in s["name"].lower()]
 
     if not matches:
-        return f"No students found matching **\"{name_q}\"** in your school."
+        return f"No students found matching \"{name_q}\" in your school."
 
-    lines = [f"## Students matching \"{name_q}\"", f"", f"**Found:** {len(matches)}", ""]
-    lines.append("| Name | Father's Name | Class | Section | Category |")
-    lines.append("|------|--------------|-------|---------|----------|")
+    lines = [f"Found {len(matches)} student(s) matching \"{name_q}\":\n"]
     for s in matches[:30]:
-        lines.append(f"| {s['name']} | {s['father_name']} | {s['class']} | {s['section']} | {s['category']} |")
+        lines.append(f"- {s['name']} — Father: {s['father_name']}, Class: {s['class']} {s['section']}, Category: {s['category']}")
+    if len(matches) > 30:
+        lines.append(f"\n...and {len(matches) - 30} more.")
+
+    return "\n".join(lines)
+
+
+async def _answer_student_by_letter(school_id: str, msg: str) -> str:
+    letter = _extract_letter_query(msg)
+    if not letter:
+        return "Please specify a letter, e.g. \"students whose name starts with A\"."
+
+    students = await _load_students(school_id)
+    matches = [s for s in students if s["name"].lower().startswith(letter)]
+
+    if not matches:
+        return f"No students found whose name starts with \"{letter.upper()}\"."
+
+    lines = [f"{len(matches)} student(s) whose name starts with \"{letter.upper()}\":\n"]
+    for s in matches[:30]:
+        lines.append(f"- {s['name']} — Father: {s['father_name']}, Class: {s['class']} {s['section']}")
+    if len(matches) > 30:
+        lines.append(f"\n...and {len(matches) - 30} more.")
 
     return "\n".join(lines)
 
@@ -277,13 +305,13 @@ async def _answer_student_by_father(school_id: str, msg: str) -> str:
     matches = [s for s in students if father_q in s["father_name"].lower()]
 
     if not matches:
-        return f"No students found with father's name matching **\"{father_q}\"**."
+        return f"No students found with father's name matching \"{father_q}\"."
 
-    lines = [f"## Students with father's name \"{father_q}\"", f"", f"**Found:** {len(matches)}", ""]
-    lines.append("| Student Name | Father's Name | Class | Section | Category |")
-    lines.append("|-------------|--------------|-------|---------|----------|")
+    lines = [f"Found {len(matches)} student(s) with father's name matching \"{father_q}\":\n"]
     for s in matches[:30]:
-        lines.append(f"| {s['name']} | {s['father_name']} | {s['class']} | {s['section']} | {s['category']} |")
+        lines.append(f"- {s['name']} — Father: {s['father_name']}, Class: {s['class']} {s['section']}")
+    if len(matches) > 30:
+        lines.append(f"\n...and {len(matches) - 30} more.")
 
     return "\n".join(lines)
 
@@ -295,20 +323,19 @@ async def _answer_student_by_category(school_id: str, msg: str) -> str:
     if cat_q:
         matches = [s for s in students if s["category"].lower() == cat_q]
         if not matches:
-            return f"No students found in category **{cat_q.upper()}**."
+            return f"No students found in {cat_q.upper()} category."
 
-        lines = [f"## {cat_q.upper()} Category Students", f"", f"**Total:** {len(matches)}", ""]
-        lines.append("| Name | Father's Name | Class | Section | Gender |")
-        lines.append("|------|--------------|-------|---------|--------|")
+        lines = [f"{len(matches)} student(s) in {cat_q.upper()} category:\n"]
         for s in matches[:30]:
-            lines.append(f"| {s['name']} | {s['father_name']} | {s['class']} | {s['section']} | {s['gender']} |")
+            lines.append(f"- {s['name']} — Father: {s['father_name']}, Class: {s['class']} {s['section']}")
+        if len(matches) > 30:
+            lines.append(f"\n...and {len(matches) - 30} more.")
         return "\n".join(lines)
 
-    # No specific category — show breakdown
     cats = _count_by(students, "category")
-    lines = [f"## Student Category Breakdown", f"", f"**Total Students:** {len(students)}", ""]
+    lines = [f"Category-wise breakdown ({len(students)} total students):\n"]
     for k, v in sorted(cats.items()):
-        lines.append(f"- **{k or 'Unknown'}:** {v}")
+        lines.append(f"- {k or 'Unknown'}: {v}")
     return "\n".join(lines)
 
 
@@ -316,11 +343,9 @@ async def _answer_class_strength(school_id: str, msg: str) -> str:
     students = await _load_students(school_id)
     classes = _count_by(students, "class")
 
-    lines = [f"## Class-wise Student Strength", f"", f"**Total Students:** {len(students)}", ""]
-    lines.append("| Class | Students |")
-    lines.append("|-------|----------|")
+    lines = [f"Class-wise student strength ({len(students)} total):\n"]
     for k, v in sorted(classes.items()):
-        lines.append(f"| {k or 'Unknown'} | {v} |")
+        lines.append(f"- {k or 'Unknown'}: {v} students")
 
     return "\n".join(lines)
 
@@ -337,20 +362,16 @@ async def _answer_school_overview(school_id: str) -> str:
     classes = _count_by(students, "class")
 
     lines = [
-        f"## School Overview",
-        f"",
-        f"### Students",
-        f"- **Total:** {total_stu} (Active: {active_stu})",
+        f"Here's an overview of your school:\n",
+        f"Students: {total_stu} ({active_stu} active)",
     ]
     for k, v in sorted(cats.items()):
-        lines.append(f"- **{k or 'Unknown'}:** {v}")
+        lines.append(f"- {k or 'Unknown'}: {v}")
     lines.append("")
-    lines.append("### Class-wise")
+    lines.append("Class-wise:")
     for k, v in sorted(classes.items()):
-        lines.append(f"- **{k or 'Unknown'}:** {v}")
-    lines.append("")
-    lines.append(f"### Teachers / Staff")
-    lines.append(f"- **Total:** {total_tea} (Active: {active_tea})")
+        lines.append(f"- {k or 'Unknown'}: {v}")
+    lines.append(f"\nTeachers/Staff: {total_tea} ({active_tea} active)")
 
     return "\n".join(lines)
 
@@ -381,6 +402,21 @@ def _extract_name_query(msg: str) -> Optional[str]:
             name = " ".join(words).strip("?.,! ")
             if name:
                 return name.lower()
+    return None
+
+
+def _extract_letter_query(msg: str) -> Optional[str]:
+    """Extract the letter from 'name starts with A' style queries."""
+    patterns = [
+        "start from ", "start with ", "starts with ", "starting with ",
+        "begin with ", "begins with ", "name from ",
+    ]
+    for pat in patterns:
+        idx = msg.find(pat)
+        if idx != -1:
+            rest = msg[idx + len(pat):].strip()
+            if rest:
+                return rest[0].lower()
     return None
 
 
