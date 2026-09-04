@@ -41,6 +41,8 @@ async def try_admin_agent(school_id: str, message: str) -> Optional[str]:
             return await _answer_student_count(school_id, msg)
         if intent == "teacher_count":
             return await _answer_teacher_count(school_id, msg)
+        if intent == "student_search":
+            return await _answer_student_search(school_id, msg)
         if intent == "student_by_name":
             return await _answer_student_by_name(school_id, msg)
         if intent == "student_by_letter":
@@ -49,6 +51,8 @@ async def try_admin_agent(school_id: str, message: str) -> Optional[str]:
             return await _answer_student_by_father(school_id, msg)
         if intent == "student_by_category":
             return await _answer_student_by_category(school_id, msg)
+        if intent == "student_phone":
+            return await _answer_student_phone(school_id, msg)
         if intent == "class_strength":
             return await _answer_class_strength(school_id, msg)
         if intent == "school_overview":
@@ -65,6 +69,13 @@ async def try_admin_agent(school_id: str, message: str) -> Optional[str]:
 # ===================================================================
 
 def _detect_intent(msg: str) -> Optional[str]:
+    # Phone / contact lookup (check early)
+    if any(k in msg for k in ["phone number", "mobile number", "contact number",
+                                "phone of", "mobile of", "contact of",
+                                "guardian number", "parent number", "parent contact",
+                                "guardian mobile", "parent mobile", "phone no"]):
+        return "student_phone"
+
     # Father name queries (check before generic student)
     if any(k in msg for k in ["father name", "father's name", "whose father", "papa ka naam",
                                 "father is", "papa"]):
@@ -81,10 +92,15 @@ def _detect_intent(msg: str) -> Optional[str]:
                                 "begin with", "begins with", "name from"]):
         return "student_by_letter"
 
+    # Generic search — "search students with name X", "search X"
+    if any(k in msg for k in ["search student", "search for student", "look up student",
+                                "find student", "lookup student"]):
+        return "student_search"
+
     # Student name search
     if any(k in msg for k in ["student named", "student name", "students named",
                                 "students with name", "student of name",
-                                "find student", "search student"]):
+                                "students of name"]):
         return "student_by_name"
 
     # Class strength
@@ -171,6 +187,7 @@ async def _load_students(school_id: str):
             "mother_name": p.get("mother_name") or "",
             "category": p.get("category") or "",
             "gender": p.get("gender") or "",
+            "phone": p.get("guardian_mobile") or "",
             "class": class_map.get(p.get("class_id", ""), ""),
             "section": section_map.get(p.get("section_id", ""), ""),
         })
@@ -256,6 +273,27 @@ async def _answer_teacher_count(school_id: str, msg: str) -> str:
     return "\n".join(lines)
 
 
+async def _answer_student_search(school_id: str, msg: str) -> str:
+    """Generic search: 'search student Rahul', 'find student Kumar'."""
+    query = _extract_search_query(msg)
+    if not query:
+        return "Please tell me the student name you want to search."
+
+    students = await _load_students(school_id)
+    matches = [s for s in students if query in s["name"].lower()]
+
+    if not matches:
+        return f"No students found matching \"{query}\" in your school."
+
+    lines = [f"Found {len(matches)} student(s) matching \"{query}\":\n"]
+    for s in matches[:30]:
+        lines.append(f"- {s['name']} \u2014 Father: {s['father_name']}, Class: {s['class']} {s['section']}, Phone: {s['phone'] or 'N/A'}")
+    if len(matches) > 30:
+        lines.append(f"\n...and {len(matches) - 30} more.")
+
+    return "\n".join(lines)
+
+
 async def _answer_student_by_name(school_id: str, msg: str) -> str:
     name_q = _extract_name_query(msg)
     if not name_q:
@@ -269,7 +307,7 @@ async def _answer_student_by_name(school_id: str, msg: str) -> str:
 
     lines = [f"Found {len(matches)} student(s) matching \"{name_q}\":\n"]
     for s in matches[:30]:
-        lines.append(f"- {s['name']} — Father: {s['father_name']}, Class: {s['class']} {s['section']}, Category: {s['category']}")
+        lines.append(f"- {s['name']} \u2014 Father: {s['father_name']}, Class: {s['class']} {s['section']}, Category: {s['category']}")
     if len(matches) > 30:
         lines.append(f"\n...and {len(matches) - 30} more.")
 
@@ -339,6 +377,45 @@ async def _answer_student_by_category(school_id: str, msg: str) -> str:
     return "\n".join(lines)
 
 
+async def _answer_student_phone(school_id: str, msg: str) -> str:
+    """Phone number lookup: 'phone number of Rahul in class 5 A'."""
+    query = _extract_phone_query(msg)
+    if not query:
+        return "Please tell me the student name whose phone number you need."
+
+    students = await _load_students(school_id)
+    matches = [s for s in students if query in s["name"].lower()]
+
+    # Optional class/section filter from the message
+    class_filter = _extract_class_filter(msg)
+    section_filter = _extract_section_filter(msg)
+    if class_filter:
+        filtered = [s for s in matches if class_filter in s["class"].lower()]
+        if filtered:
+            matches = filtered
+    if section_filter:
+        filtered = [s for s in matches if section_filter in s["section"].lower()]
+        if filtered:
+            matches = filtered
+
+    if not matches:
+        return f"No student found matching \"{query}\"."
+
+    if len(matches) == 1:
+        s = matches[0]
+        phone = s['phone'] or 'Not available'
+        return f"{s['name']} (Class {s['class']} {s['section']}) \u2014 Guardian phone: {phone}"
+
+    lines = [f"Found {len(matches)} student(s) matching \"{query}\":\n"]
+    for s in matches[:20]:
+        phone = s['phone'] or 'N/A'
+        lines.append(f"- {s['name']} \u2014 Class: {s['class']} {s['section']}, Phone: {phone}")
+    if len(matches) > 20:
+        lines.append(f"\n...and {len(matches) - 20} more. Try adding the class/section to narrow down.")
+
+    return "\n".join(lines)
+
+
 async def _answer_class_strength(school_id: str, msg: str) -> str:
     students = await _load_students(school_id)
     classes = _count_by(students, "class")
@@ -392,7 +469,7 @@ def _extract_name_query(msg: str) -> Optional[str]:
     patterns = [
         "students named ", "student named ", "students with name ",
         "student with name ", "students of name ", "student of name ",
-        "find student ", "search student ", "named ",
+        "named ",
     ]
     for pat in patterns:
         idx = msg.find(pat)
@@ -402,6 +479,78 @@ def _extract_name_query(msg: str) -> Optional[str]:
             name = " ".join(words).strip("?.,! ")
             if name:
                 return name.lower()
+    return None
+
+
+def _extract_search_query(msg: str) -> Optional[str]:
+    """Extract name from generic search queries."""
+    patterns = [
+        "search student ", "search for student ", "find student ",
+        "look up student ", "lookup student ", "search students ",
+    ]
+    for pat in patterns:
+        idx = msg.find(pat)
+        if idx != -1:
+            rest = msg[idx + len(pat):].strip()
+            # Remove trailing class/section hints
+            for stop in [" in class", " of class", " from class"]:
+                si = rest.find(stop)
+                if si != -1:
+                    rest = rest[:si]
+            words = rest.split()[:3]
+            name = " ".join(words).strip("?.,! ")
+            if name:
+                return name.lower()
+    return None
+
+
+def _extract_phone_query(msg: str) -> Optional[str]:
+    """Extract student name from phone lookup queries."""
+    patterns = [
+        "phone number of ", "mobile number of ", "contact number of ",
+        "phone of ", "mobile of ", "contact of ",
+        "phone no of ", "guardian number of ", "parent number of ",
+        "parent contact of ", "parent mobile of ",
+    ]
+    for pat in patterns:
+        idx = msg.find(pat)
+        if idx != -1:
+            rest = msg[idx + len(pat):].strip()
+            # Remove class/section hints from the end
+            for stop in [" in class", " of class", " from class", " class "]:
+                si = rest.find(stop)
+                if si != -1:
+                    rest = rest[:si]
+            words = rest.split()[:3]
+            name = " ".join(words).strip("?.,! ")
+            if name:
+                return name.lower()
+    return None
+
+
+def _extract_class_filter(msg: str) -> Optional[str]:
+    """Extract class name/number from message like 'in class 5' or 'class 10'."""
+    patterns = ["in class ", "of class ", "from class ", "class "]
+    for pat in patterns:
+        idx = msg.find(pat)
+        if idx != -1:
+            rest = msg[idx + len(pat):].strip()
+            word = rest.split()[0].strip("?.,! ") if rest.split() else ""
+            if word:
+                return word.lower()
+    return None
+
+
+def _extract_section_filter(msg: str) -> Optional[str]:
+    """Extract section from message like 'section A' or 'section b'."""
+    patterns = ["section "]
+    for pat in patterns:
+        idx = msg.find(pat)
+        if idx != -1:
+            rest = msg[idx + len(pat):].strip()
+            word = rest.split()[0].strip("?.,! ") if rest.split() else ""
+            if word:
+                return word.lower()
     return None
 
 
