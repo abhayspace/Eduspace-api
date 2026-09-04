@@ -9,12 +9,16 @@ can fall back to the normal Groq LLM path.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import httpx
+
+from config import get_settings
 from database import get_client
 
 logger = logging.getLogger("eduspace.eddy.school_data")
@@ -498,7 +502,16 @@ async def _answer_school_overview(school_id: str) -> str:
 
 async def _answer_send_announcement(school_id: str, original_msg: str, user: Dict) -> str:
     """Extract title+body from the user message and create an announcement for all users."""
-    title, body = _extract_announcement_content(original_msg)
+    extracted = await _llm_extract_json(
+        original_msg,
+        "Extract the announcement title and body/message from this admin request. "
+        "Return JSON: {\"title\": \"...\", \"body\": \"...\"}. "
+        "If the user just gave a message without a separate title, generate a short title from the message. "
+        "Keep the body exactly as the user intended it.",
+    )
+    title = (extracted.get("title") or "").strip()
+    body = (extracted.get("body") or "").strip()
+
     if not title and not body:
         return (
             "Please tell me the announcement you want to send. For example:\n"
@@ -545,8 +558,20 @@ async def _answer_send_announcement(school_id: str, original_msg: str, user: Dic
 
 async def _answer_add_calendar_event(school_id: str, original_msg: str, user: Dict) -> str:
     """Parse event details from the message and add to the school calendar."""
-    event_info = _extract_calendar_event(original_msg)
-    if not event_info.get("title"):
+    today_str = date.today().isoformat()
+    extracted = await _llm_extract_json(
+        original_msg,
+        f"Extract calendar event details from this admin request. Today is {today_str}. "
+        "Return JSON: {\"title\": \"...\", \"event_date\": \"YYYY-MM-DD\", "
+        "\"end_date\": \"YYYY-MM-DD or null\", \"event_type\": \"holiday|special_day\"}. "
+        "event_type must be exactly 'holiday' or 'special_day'. "
+        "If user says holiday use 'holiday', for events/celebrations use 'special_day'. "
+        "If the user doesn't mention a year, assume the current or next occurrence. "
+        "The title should be a clean, proper name for the event.",
+    )
+
+    title = (extracted.get("title") or "").strip()
+    if not title:
         return (
             "Please tell me the event details. For example:\n"
             "\"Add holiday on 15 August: Independence Day\"\n"
@@ -554,10 +579,13 @@ async def _answer_add_calendar_event(school_id: str, original_msg: str, user: Di
             "\"Mark holiday from 1 November to 5 November: Diwali break\""
         )
 
-    title = event_info["title"]
-    event_date = event_info.get("date") or date.today().isoformat()
-    end_date = event_info.get("end_date")
-    event_type = event_info.get("type", "holiday")
+    event_date = (extracted.get("event_date") or "").strip() or today_str
+    end_date = (extracted.get("end_date") or "").strip() or None
+    if end_date == "null":
+        end_date = None
+    event_type = (extracted.get("event_type") or "holiday").strip()
+    if event_type not in ("holiday", "special_day"):
+        event_type = "holiday"
 
     client = get_client()
     created_by = user.get("full_name") or "Admin"
@@ -663,6 +691,58 @@ async def _answer_expense_summary(school_id: str) -> str:
         f"- Net profit: Rs {profit:,.0f}",
     ]
     return "\n".join(lines)
+
+
+# ===================================================================
+# LLM extraction helper
+# ===================================================================
+
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+async def _llm_extract_json(user_msg: str, system_instruction: str) -> Dict[str, Any]:
+    """Use Groq to extract structured JSON from a user message.
+
+    Returns the parsed dict or {} on failure.
+    """
+    settings = get_settings()
+    api_key = settings.groq_api_key
+    model = settings.groq_model or "llama-3.1-8b-instant"
+    if not api_key:
+        logger.warning("No GROQ_API_KEY — falling back to regex extraction")
+        return {}
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_instruction + "\nRespond ONLY with valid JSON, no markdown, no explanation."},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.0,
+        "max_completion_tokens": 300,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(
+                GROQ_CHAT_URL,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                json=payload,
+            )
+        if res.status_code >= 400:
+            logger.warning("LLM extract failed: %s %s", res.status_code, res.text[:200])
+            return {}
+
+        data = res.json()
+        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = re.sub(r'^```\w*\n?', '', text)
+            text = re.sub(r'\n?```$', '', text)
+        return json.loads(text)
+    except (json.JSONDecodeError, httpx.HTTPError, Exception) as exc:
+        logger.warning("LLM extract error: %s", exc)
+        return {}
 
 
 # ===================================================================
