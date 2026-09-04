@@ -127,13 +127,18 @@ async def _load_students(school_id: str):
         return []
 
     user_ids = [p["user_id"] for p in profiles if p.get("user_id")]
-    users_res = await (
-        client.table("users")
-        .select("id,full_name,is_active")
-        .in_("id", user_ids)
-        .execute()
-    )
-    users_map: Dict[str, dict] = {u["id"]: u for u in (users_res.data or [])}
+    users_map: Dict[str, dict] = {}
+    # Batch in chunks of 50 to avoid Supabase URL length limits
+    for i in range(0, len(user_ids), 50):
+        batch = user_ids[i:i + 50]
+        users_res = await (
+            client.table("users")
+            .select("id,full_name,is_active")
+            .in_("id", batch)
+            .execute()
+        )
+        for u in (users_res.data or []):
+            users_map[u["id"]] = u
 
     class_ids = list({p["class_id"] for p in profiles if p.get("class_id")})
     section_ids = list({p["section_id"] for p in profiles if p.get("section_id")})
