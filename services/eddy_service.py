@@ -117,7 +117,7 @@ def _extract_text(payload: dict) -> str:
 async def generate_reply(body: EddyChatIn, user: dict) -> tuple[str, str]:
     # Rule-based admin agent — bypasses LLM entirely
     if user.get("role") in ADMIN_ROLES and user.get("school_id"):
-        agent_reply = await try_admin_agent(user["school_id"], body.message)
+        agent_reply = await try_admin_agent(user["school_id"], body.message, user)
         if agent_reply:
             logger.info("Eddy admin agent answered directly (no LLM)")
             return agent_reply, "admin-agent"
@@ -158,7 +158,7 @@ async def stream_reply(body: EddyChatIn, user: dict) -> AsyncIterator[str]:
     """Stream plain text chunks from Groq chat completions SSE."""
     # Rule-based admin agent — yield entire reply in one chunk
     if user.get("role") in ADMIN_ROLES and user.get("school_id"):
-        agent_reply = await try_admin_agent(user["school_id"], body.message)
+        agent_reply = await try_admin_agent(user["school_id"], body.message, user)
         if agent_reply:
             logger.info("Eddy admin agent answered directly (stream, no LLM)")
             yield agent_reply

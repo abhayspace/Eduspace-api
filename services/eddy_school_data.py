@@ -10,6 +10,9 @@ can fall back to the normal Groq LLM path.
 from __future__ import annotations
 
 import logging
+import re
+import uuid
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from database import get_client
@@ -23,12 +26,13 @@ ADMIN_ROLES = {"school_admin", "principal", "super_admin", "vice_principal"}
 # Public entry point
 # ===================================================================
 
-async def try_admin_agent(school_id: str, message: str) -> Optional[str]:
+async def try_admin_agent(school_id: str, message: str, user: Optional[Dict] = None) -> Optional[str]:
     """Attempt to answer an admin school-data question.
 
     Returns a markdown reply string, or None if this isn't a data query.
     """
     msg = message.lower().strip()
+    user = user or {}
 
     intent = _detect_intent(msg)
     if intent is None:
@@ -57,6 +61,14 @@ async def try_admin_agent(school_id: str, message: str) -> Optional[str]:
             return await _answer_class_strength(school_id, msg)
         if intent == "school_overview":
             return await _answer_school_overview(school_id)
+        if intent == "send_announcement":
+            return await _answer_send_announcement(school_id, message, user)
+        if intent == "add_calendar_event":
+            return await _answer_add_calendar_event(school_id, message, user)
+        if intent == "fee_summary":
+            return await _answer_fee_summary(school_id)
+        if intent == "expense_summary":
+            return await _answer_expense_summary(school_id)
     except Exception:
         logger.exception("Eddy admin agent failed for intent=%s", intent)
         return None
@@ -123,6 +135,33 @@ def _detect_intent(msg: str) -> Optional[str]:
                                 "how many staff", "total staff", "staff count",
                                 "faculty", "employees"]):
         return "teacher_count"
+
+    # Announcement
+    if any(k in msg for k in ["send announcement", "create announcement", "make announcement",
+                                "announce to all", "send notice", "broadcast message",
+                                "send this announcement", "announcement to all"]):
+        return "send_announcement"
+
+    # Calendar event / holiday
+    if any(k in msg for k in ["add holiday", "add event", "add to calendar",
+                                "create holiday", "create event", "mark holiday",
+                                "school holiday", "add special day", "calendar event"]):
+        return "add_calendar_event"
+
+    # Fee summary
+    if any(k in msg for k in ["fee summary", "fees summary", "total due", "total fees",
+                                "pending fees", "fee collection", "fees due",
+                                "unpaid fees", "paid this month", "fee status",
+                                "how much fee", "kitne fees", "fees collected"]):
+        return "fee_summary"
+
+    # Expense / income summary
+    if any(k in msg for k in ["expense summary", "expenses summary", "income summary",
+                                "total expense", "total income", "profit",
+                                "income and expense", "expense report", "spending",
+                                "school expenses", "school income", "this month expense",
+                                "this month income"]):
+        return "expense_summary"
 
     # Generic overview
     if any(k in msg for k in ["school overview", "school summary", "school stats",
@@ -454,6 +493,179 @@ async def _answer_school_overview(school_id: str) -> str:
 
 
 # ===================================================================
+# Announcement
+# ===================================================================
+
+async def _answer_send_announcement(school_id: str, original_msg: str, user: Dict) -> str:
+    """Extract title+body from the user message and create an announcement for all users."""
+    title, body = _extract_announcement_content(original_msg)
+    if not title and not body:
+        return (
+            "Please tell me the announcement you want to send. For example:\n"
+            "\"Send announcement: Tomorrow is a holiday due to heavy rain.\"\n\n"
+            "Or:\n\"Create announcement title: Holiday Notice, message: School will remain "
+            "closed tomorrow due to weather.\""
+        )
+
+    if not title:
+        title = body[:60] + ("..." if len(body) > 60 else "")
+    if not body:
+        body = title
+
+    client = get_client()
+    author = user.get("full_name") or "Admin"
+    row = {
+        "school_id": school_id,
+        "title": title.strip(),
+        "body": body.strip(),
+        "audience": "all",
+        "author": author,
+    }
+    inserted = await client.table("announcements").insert(row).execute()
+    if not inserted.data:
+        return "Sorry, I couldn't create the announcement. Please try again."
+
+    # Notify all users
+    try:
+        from services.notification_service import notify_school
+        await notify_school(school_id, f"New announcement: {title}", body[:280])
+    except Exception:
+        logger.warning("Failed to send notification for announcement")
+
+    return (
+        f"Announcement sent to all users!\n\n"
+        f"Title: {title}\n"
+        f"Message: {body}"
+    )
+
+
+# ===================================================================
+# Calendar event
+# ===================================================================
+
+async def _answer_add_calendar_event(school_id: str, original_msg: str, user: Dict) -> str:
+    """Parse event details from the message and add to the school calendar."""
+    event_info = _extract_calendar_event(original_msg)
+    if not event_info.get("title"):
+        return (
+            "Please tell me the event details. For example:\n"
+            "\"Add holiday on 15 August: Independence Day\"\n"
+            "\"Add event on 25 December: Christmas celebration\"\n"
+            "\"Mark holiday from 1 November to 5 November: Diwali break\""
+        )
+
+    title = event_info["title"]
+    event_date = event_info.get("date") or date.today().isoformat()
+    end_date = event_info.get("end_date")
+    event_type = event_info.get("type", "holiday")
+
+    client = get_client()
+    created_by = user.get("full_name") or "Admin"
+    payload = {
+        "id": str(uuid.uuid4()),
+        "school_id": school_id,
+        "event_type": event_type,
+        "title": title.strip(),
+        "description": None,
+        "event_date": event_date,
+        "end_date": end_date or event_date,
+        "created_by": created_by,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    res = await client.table("school_calendar_events").insert(payload).execute()
+    if not res.data:
+        return "Sorry, I couldn't add the event to the calendar. Please try again."
+
+    reply = f"Added to school calendar!\n\nType: {event_type.replace('_', ' ').title()}\nTitle: {title}\nDate: {event_date}"
+    if end_date and end_date != event_date:
+        reply += f" to {end_date}"
+    return reply
+
+
+# ===================================================================
+# Fee summary
+# ===================================================================
+
+async def _answer_fee_summary(school_id: str) -> str:
+    """Fetch fee dashboard stats and return a summary."""
+    from services.fee_structure_service import school_fee_dashboard_stats
+    stats = await school_fee_dashboard_stats(school_id)
+
+    total_due = stats.get("total_due", 0)
+    paid_month = stats.get("paid_this_month", 0)
+    unpaid = stats.get("unpaid_students_this_month", 0)
+
+    today = date.today()
+    month_label = today.strftime("%B %Y")
+
+    lines = [
+        f"Fee summary for {month_label}:\n",
+        f"- Total pending dues: Rs {total_due:,.0f}",
+        f"- Collected this month: Rs {paid_month:,.0f}",
+        f"- Students with unpaid fees this month: {unpaid}",
+    ]
+    return "\n".join(lines)
+
+
+# ===================================================================
+# Expense / income summary
+# ===================================================================
+
+async def _answer_expense_summary(school_id: str) -> str:
+    """Fetch current month income/expense report."""
+    today = date.today()
+    month_label = today.strftime("%B %Y")
+
+    client = get_client()
+    # Fetch expense_transactions for this month
+    from calendar import monthrange
+    month_start = date(today.year, today.month, 1).isoformat()
+    month_end = date(today.year, today.month, monthrange(today.year, today.month)[1]).isoformat()
+
+    tx_res = await (
+        client.table("expense_transactions")
+        .select("amount,type,transaction_date")
+        .eq("school_id", school_id)
+        .gte("transaction_date", month_start)
+        .lte("transaction_date", month_end)
+        .execute()
+    )
+
+    income = 0.0
+    expenses = 0.0
+    for row in (tx_res.data or []):
+        amt = float(row.get("amount") or 0)
+        if row.get("type") == "income":
+            income += amt
+        else:
+            expenses += amt
+
+    # Also add fee payments as income
+    pay_res = await (
+        client.table("payments")
+        .select("amount")
+        .eq("school_id", school_id)
+        .gte("paid_at", f"{month_start}T00:00:00")
+        .lte("paid_at", f"{month_end}T23:59:59")
+        .execute()
+    )
+    for row in (pay_res.data or []):
+        income += float(row.get("amount") or 0)
+
+    income = round(income, 2)
+    expenses = round(expenses, 2)
+    profit = round(income - expenses, 2)
+
+    lines = [
+        f"Financial summary for {month_label}:\n",
+        f"- Total income: Rs {income:,.0f}",
+        f"- Total expenses: Rs {expenses:,.0f}",
+        f"- Net profit: Rs {profit:,.0f}",
+    ]
+    return "\n".join(lines)
+
+
+# ===================================================================
 # Helpers
 # ===================================================================
 
@@ -591,3 +803,157 @@ def _extract_category_query(msg: str) -> Optional[str]:
         if f"category {cat}" in msg or f"{cat} category" in msg or f"of {cat}" in msg or f"{cat} student" in msg:
             return cat
     return None
+
+
+def _extract_announcement_content(msg: str) -> tuple:
+    """Extract title and body from announcement message.
+
+    Supports formats like:
+    - "send announcement: <message>"
+    - "create announcement title: X, message: Y"
+    - "send this announcement <message>"
+    """
+    text = msg.strip()
+
+    # Try "title: X, message: Y" / "title: X, body: Y"
+    title_match = re.search(r'title\s*:\s*(.+?)(?:,\s*(?:message|body)\s*:\s*(.+))', text, re.IGNORECASE)
+    if title_match:
+        return title_match.group(1).strip(), (title_match.group(2) or "").strip()
+
+    # Try after colon: "send announcement: message text here"
+    for prefix in [
+        "send announcement", "create announcement", "make announcement",
+        "send this announcement", "send notice", "broadcast message",
+        "announce to all", "announcement to all",
+    ]:
+        idx = text.lower().find(prefix)
+        if idx != -1:
+            rest = text[idx + len(prefix):].strip()
+            # Remove leading colon, dash, or "that"
+            rest = re.sub(r'^[\s:;\-]+', '', rest)
+            rest = re.sub(r'^that\s+', '', rest, flags=re.IGNORECASE)
+            if rest:
+                return "", rest.strip()
+
+    return "", ""
+
+
+_MONTH_MAP = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10, "oct": 10,
+    "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+
+
+def _parse_natural_date(text: str) -> Optional[str]:
+    """Parse dates like '15 August', '25 Dec 2025', '2025-08-15'."""
+    text = text.strip()
+
+    # ISO format
+    iso = re.match(r'(\d{4})-(\d{1,2})-(\d{1,2})', text)
+    if iso:
+        return text[:10]
+
+    # "15 August" or "15 August 2025"
+    m = re.match(r'(\d{1,2})\s+(\w+)(?:\s+(\d{4}))?', text)
+    if m:
+        day = int(m.group(1))
+        month_name = m.group(2).lower()
+        year = int(m.group(3)) if m.group(3) else date.today().year
+        month_num = _MONTH_MAP.get(month_name)
+        if month_num and 1 <= day <= 31:
+            try:
+                return date(year, month_num, day).isoformat()
+            except ValueError:
+                pass
+
+    # "August 15" or "Aug 15, 2025"
+    m = re.match(r'(\w+)\s+(\d{1,2})(?:\s*,?\s*(\d{4}))?', text)
+    if m:
+        month_name = m.group(1).lower()
+        day = int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else date.today().year
+        month_num = _MONTH_MAP.get(month_name)
+        if month_num and 1 <= day <= 31:
+            try:
+                return date(year, month_num, day).isoformat()
+            except ValueError:
+                pass
+
+    return None
+
+
+def _extract_calendar_event(msg: str) -> Dict[str, Any]:
+    """Extract event type, title, date, end_date from natural language."""
+    result: Dict[str, Any] = {"title": "", "date": None, "end_date": None, "type": "holiday"}
+
+    text = msg.strip()
+
+    # Determine event type
+    lower = text.lower()
+    if "special day" in lower or "special event" in lower or "celebration" in lower:
+        result["type"] = "special_day"
+    elif "holiday" in lower:
+        result["type"] = "holiday"
+    elif "event" in lower:
+        result["type"] = "special_day"
+
+    # Try "from DATE to DATE" pattern
+    range_match = re.search(r'from\s+(.+?)\s+to\s+(.+?)(?:\s*[:\-]\s*(.+))?$', text, re.IGNORECASE)
+    if range_match:
+        d1 = _parse_natural_date(range_match.group(1))
+        d2 = _parse_natural_date(range_match.group(2))
+        title_part = (range_match.group(3) or "").strip()
+        if d1:
+            result["date"] = d1
+            result["end_date"] = d2 or d1
+            if title_part:
+                result["title"] = title_part
+            return result
+
+    # Try "on DATE: title" or "on DATE title"
+    on_match = re.search(r'on\s+(.+?)(?:\s*[:\-]\s*(.+))?$', text, re.IGNORECASE)
+    if on_match:
+        date_part = on_match.group(1).strip()
+        title_part = (on_match.group(2) or "").strip()
+        # The date part may also contain the title after the date
+        parsed = _parse_natural_date(date_part)
+        if parsed:
+            result["date"] = parsed
+            if title_part:
+                result["title"] = title_part
+            return result
+        # Try splitting: "15 August Independence Day"
+        words = date_part.split()
+        for i in range(min(3, len(words)), 0, -1):
+            candidate = " ".join(words[:i])
+            parsed = _parse_natural_date(candidate)
+            if parsed:
+                result["date"] = parsed
+                remaining = " ".join(words[i:]).strip(":- ")
+                result["title"] = (remaining + " " + title_part).strip()
+                return result
+
+    # Fallback: remove the command prefix and try to find a date anywhere
+    for prefix in ["add holiday", "add event", "create holiday", "create event",
+                    "mark holiday", "add special day", "add to calendar", "calendar event"]:
+        idx = lower.find(prefix)
+        if idx != -1:
+            rest = text[idx + len(prefix):].strip()
+            rest = re.sub(r'^[\s:;\-]+', '', rest)
+            # Try to find date in the rest
+            date_match = re.search(r'(\d{1,2}\s+\w+(?:\s+\d{4})?)', rest)
+            if date_match:
+                parsed = _parse_natural_date(date_match.group(1))
+                if parsed:
+                    result["date"] = parsed
+                    title = rest.replace(date_match.group(1), "").strip(":- ,")
+                    result["title"] = title
+                    return result
+            # No date found, treat rest as title
+            if rest:
+                result["title"] = rest
+            return result
+
+    return result
