@@ -1,8 +1,11 @@
-"""Eddy AI — school data context for admin queries.
+"""Eddy AI — rule-based admin agent.
 
-Fetches live school statistics (student counts, teacher counts, category
-breakdowns, name/father-name lookups) so the LLM can answer admin
-questions with real data.
+Handles school data queries (student counts, teacher counts, name lookups,
+category breakdowns, etc.) directly from the database. Returns a fully
+formatted markdown reply — no LLM needed.
+
+If the message is not a school-data question, returns None so the caller
+can fall back to the normal Groq LLM path.
 """
 from __future__ import annotations
 
@@ -16,77 +19,103 @@ logger = logging.getLogger("eduspace.eddy.school_data")
 ADMIN_ROLES = {"school_admin", "principal", "super_admin", "vice_principal"}
 
 
-async def fetch_school_context(school_id: str, message: str) -> str:
-    """Return a data-context string to inject into the system prompt.
+# ===================================================================
+# Public entry point
+# ===================================================================
 
-    Only runs real DB queries when the message seems to ask about school data.
-    Returns an empty string if nothing relevant is detected.
+async def try_admin_agent(school_id: str, message: str) -> Optional[str]:
+    """Attempt to answer an admin school-data question.
+
+    Returns a markdown reply string, or None if this isn't a data query.
     """
-    msg = message.lower()
+    msg = message.lower().strip()
 
-    needs_students = _mentions_students(msg)
-    needs_teachers = _mentions_teachers(msg)
+    intent = _detect_intent(msg)
+    if intent is None:
+        return None
 
-    logger.info("Eddy school context: school=%s students=%s teachers=%s msg=%r",
-                school_id, needs_students, needs_teachers, msg[:100])
-
-    if not needs_students and not needs_teachers:
-        return ""
-
-    parts: List[str] = []
+    logger.info("Eddy admin agent: school=%s intent=%s msg=%r", school_id, intent, msg[:100])
 
     try:
-        if needs_students:
-            parts.append(await _student_context(school_id, msg))
-        if needs_teachers:
-            parts.append(await _teacher_context(school_id, msg))
+        if intent == "student_count":
+            return await _answer_student_count(school_id, msg)
+        if intent == "teacher_count":
+            return await _answer_teacher_count(school_id, msg)
+        if intent == "student_by_name":
+            return await _answer_student_by_name(school_id, msg)
+        if intent == "student_by_father":
+            return await _answer_student_by_father(school_id, msg)
+        if intent == "student_by_category":
+            return await _answer_student_by_category(school_id, msg)
+        if intent == "class_strength":
+            return await _answer_class_strength(school_id, msg)
+        if intent == "school_overview":
+            return await _answer_school_overview(school_id)
     except Exception:
-        logger.exception("Failed to fetch school context for Eddy")
-        return ""
+        logger.exception("Eddy admin agent failed for intent=%s", intent)
+        return None
 
-    context = "\n".join(p for p in parts if p)
-    if not context:
-        return ""
-
-    return (
-        "\n\n--- SCHOOL DATA (live from database, use this to answer) ---\n"
-        + context
-        + "\n--- END SCHOOL DATA ---\n"
-    )
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Keyword detection
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Intent detection
+# ===================================================================
 
-_STUDENT_KEYWORDS = [
-    "student", "students", "how many student", "total student",
-    "father name", "father's name", "category", "obc", "general", " sc ", " st ",
-    "class", "section", "admission", "enrolled", "strength",
-]
+def _detect_intent(msg: str) -> Optional[str]:
+    # Father name queries (check before generic student)
+    if any(k in msg for k in ["father name", "father's name", "whose father", "papa ka naam"]):
+        return "student_by_father"
 
-_TEACHER_KEYWORDS = [
-    "teacher", "teachers", "staff", "how many teacher", "total teacher",
-    "faculty", "employee",
-]
+    # Category queries
+    if any(k in msg for k in ["category", "obc student", "sc student", "st student",
+                                "general student", "minor student",
+                                "obc category", "sc category", "st category"]):
+        return "student_by_category"
+
+    # Student name search
+    if any(k in msg for k in ["student named", "student name", "students named",
+                                "students with name", "student of name",
+                                "find student", "search student"]):
+        return "student_by_name"
+
+    # Class strength
+    if any(k in msg for k in ["class strength", "strength of class", "students in class",
+                                "how many in class", "class wise"]):
+        return "class_strength"
+
+    # Student count
+    if any(k in msg for k in ["how many student", "total student", "student count",
+                                "number of student", "kitne student", "kitne bachche",
+                                "students are there", "students are their",
+                                "students in my school", "students in school",
+                                "enrolled student"]):
+        return "student_count"
+
+    # Teacher / staff count
+    if any(k in msg for k in ["how many teacher", "total teacher", "teacher count",
+                                "number of teacher", "kitne teacher",
+                                "teachers are there", "teachers are their",
+                                "how many staff", "total staff", "staff count",
+                                "faculty", "employees"]):
+        return "teacher_count"
+
+    # Generic overview
+    if any(k in msg for k in ["school overview", "school summary", "school stats",
+                                "school data", "about my school", "tell me about school"]):
+        return "school_overview"
+
+    return None
 
 
-def _mentions_students(msg: str) -> bool:
-    return any(kw in msg for kw in _STUDENT_KEYWORDS)
+# ===================================================================
+# Data fetchers (shared)
+# ===================================================================
 
-
-def _mentions_teachers(msg: str) -> bool:
-    return any(kw in msg for kw in _TEACHER_KEYWORDS)
-
-
-# ---------------------------------------------------------------------------
-# Student context
-# ---------------------------------------------------------------------------
-
-async def _student_context(school_id: str, msg: str) -> str:
+async def _load_students(school_id: str):
+    """Fetch all students with user info, class/section names."""
     client = get_client()
 
-    # Fetch all students with their user info
     stu_res = await (
         client.table("students")
         .select("id,user_id,father_name,mother_name,category,class_id,section_id,gender,guardian_mobile")
@@ -94,9 +123,8 @@ async def _student_context(school_id: str, msg: str) -> str:
         .execute()
     )
     profiles = stu_res.data or []
-
     if not profiles:
-        return "Total students in the school: 0"
+        return []
 
     user_ids = [p["user_id"] for p in profiles if p.get("user_id")]
     users_res = await (
@@ -107,7 +135,6 @@ async def _student_context(school_id: str, msg: str) -> str:
     )
     users_map: Dict[str, dict] = {u["id"]: u for u in (users_res.data or [])}
 
-    # Resolve class/section names
     class_ids = list({p["class_id"] for p in profiles if p.get("class_id")})
     section_ids = list({p["section_id"] for p in profiles if p.get("section_id")})
     class_map: Dict[str, str] = {}
@@ -119,7 +146,6 @@ async def _student_context(school_id: str, msg: str) -> str:
         sec_res = await client.table("sections").select("id,name").in_("id", section_ids).execute()
         section_map = {s["id"]: s["name"] for s in (sec_res.data or [])}
 
-    # Build enriched list
     students: List[Dict[str, Any]] = []
     for p in profiles:
         user = users_map.get(p.get("user_id", ""))
@@ -135,128 +161,217 @@ async def _student_context(school_id: str, msg: str) -> str:
             "class": class_map.get(p.get("class_id", ""), ""),
             "section": section_map.get(p.get("section_id", ""), ""),
         })
-
-    total = len(students)
-    active = sum(1 for s in students if s["active"])
-
-    lines = [f"Total students: {total} (active: {active})"]
-
-    # Category breakdown
-    cats: Dict[str, int] = {}
-    for s in students:
-        c = s["category"] or "Unknown"
-        cats[c] = cats.get(c, 0) + 1
-    if cats:
-        lines.append("Category breakdown: " + ", ".join(f"{k}: {v}" for k, v in sorted(cats.items())))
-
-    # Gender breakdown
-    genders: Dict[str, int] = {}
-    for s in students:
-        g = s["gender"] or "Unknown"
-        genders[g] = genders.get(g, 0) + 1
-    if genders:
-        lines.append("Gender breakdown: " + ", ".join(f"{k}: {v}" for k, v in sorted(genders.items())))
-
-    # Class-wise breakdown
-    class_counts: Dict[str, int] = {}
-    for s in students:
-        cn = s["class"] or "Unknown"
-        class_counts[cn] = class_counts.get(cn, 0) + 1
-    if class_counts:
-        lines.append("Class-wise: " + ", ".join(f"{k}: {v}" for k, v in sorted(class_counts.items())))
-
-    # If asking about a specific name
-    name_query = _extract_name_query(msg, "student")
-    if name_query:
-        matches = [s for s in students if name_query in s["name"].lower()]
-        if matches:
-            lines.append(f"\nStudents matching name '{name_query}':")
-            for s in matches[:20]:
-                lines.append(
-                    f"  - {s['name']} | Father: {s['father_name']} | Class: {s['class']} {s['section']} | Category: {s['category']}"
-                )
-        else:
-            lines.append(f"\nNo students found matching name '{name_query}'.")
-
-    # If asking about father's name
-    father_query = _extract_father_query(msg)
-    if father_query:
-        matches = [s for s in students if father_query in s["father_name"].lower()]
-        if matches:
-            lines.append(f"\nStudents with father's name matching '{father_query}':")
-            for s in matches[:20]:
-                lines.append(
-                    f"  - {s['name']} | Father: {s['father_name']} | Class: {s['class']} {s['section']}"
-                )
-        else:
-            lines.append(f"\nNo students found with father's name matching '{father_query}'.")
-
-    # If asking about a specific category
-    cat_query = _extract_category_query(msg)
-    if cat_query:
-        matches = [s for s in students if s["category"].lower() == cat_query]
-        lines.append(f"\nStudents in category '{cat_query.upper()}': {len(matches)}")
-
-    return "\n".join(lines)
+    return students
 
 
-# ---------------------------------------------------------------------------
-# Teacher context
-# ---------------------------------------------------------------------------
-
-async def _teacher_context(school_id: str, msg: str) -> str:
+async def _load_teachers(school_id: str):
     client = get_client()
-
-    teacher_res = await (
+    res = await (
         client.table("users")
         .select("id,full_name,is_active,gender")
         .eq("school_id", school_id)
         .eq("role", "teacher")
         .execute()
     )
-    teachers = teacher_res.data or []
+    return res.data or []
+
+
+# ===================================================================
+# Answer builders
+# ===================================================================
+
+async def _answer_student_count(school_id: str, msg: str) -> str:
+    students = await _load_students(school_id)
+    total = len(students)
+    active = sum(1 for s in students if s["active"])
+
+    cats = _count_by(students, "category")
+    genders = _count_by(students, "gender")
+    classes = _count_by(students, "class")
+
+    lines = [
+        f"## Students in Your School",
+        f"",
+        f"**Total Students:** {total}",
+        f"**Active:** {active}",
+        f"",
+    ]
+
+    if genders:
+        lines.append("### Gender Breakdown")
+        for k, v in sorted(genders.items()):
+            lines.append(f"- **{k or 'Unknown'}:** {v}")
+        lines.append("")
+
+    if cats:
+        lines.append("### Category Breakdown")
+        for k, v in sorted(cats.items()):
+            lines.append(f"- **{k or 'Unknown'}:** {v}")
+        lines.append("")
+
+    if classes:
+        lines.append("### Class-wise Strength")
+        for k, v in sorted(classes.items()):
+            lines.append(f"- **{k or 'Unknown'}:** {v}")
+
+    return "\n".join(lines)
+
+
+async def _answer_teacher_count(school_id: str, msg: str) -> str:
+    teachers = await _load_teachers(school_id)
     total = len(teachers)
     active = sum(1 for t in teachers if t.get("is_active", True))
-
-    lines = [f"Total teachers/staff: {total} (active: {active})"]
 
     genders: Dict[str, int] = {}
     for t in teachers:
         g = t.get("gender") or "Unknown"
         genders[g] = genders.get(g, 0) + 1
-    if genders:
-        lines.append("Gender breakdown: " + ", ".join(f"{k}: {v}" for k, v in sorted(genders.items())))
 
-    # Name search
-    name_query = _extract_name_query(msg, "teacher")
-    if name_query:
-        matches = [t for t in teachers if name_query in t["full_name"].lower()]
-        if matches:
-            lines.append(f"\nTeachers matching '{name_query}':")
-            for t in matches[:20]:
-                lines.append(f"  - {t['full_name']}")
-        else:
-            lines.append(f"\nNo teachers found matching '{name_query}'.")
+    lines = [
+        f"## Teachers / Staff in Your School",
+        f"",
+        f"**Total Teachers:** {total}",
+        f"**Active:** {active}",
+        f"",
+    ]
+
+    if genders:
+        lines.append("### Gender Breakdown")
+        for k, v in sorted(genders.items()):
+            lines.append(f"- **{k or 'Unknown'}:** {v}")
 
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Query extraction helpers
-# ---------------------------------------------------------------------------
+async def _answer_student_by_name(school_id: str, msg: str) -> str:
+    name_q = _extract_name_query(msg)
+    if not name_q:
+        return "Please specify a student name to search for."
 
-def _extract_name_query(msg: str, entity: str) -> Optional[str]:
-    """Try to pull out a name the user is searching for."""
+    students = await _load_students(school_id)
+    matches = [s for s in students if name_q in s["name"].lower()]
+
+    if not matches:
+        return f"No students found matching **\"{name_q}\"** in your school."
+
+    lines = [f"## Students matching \"{name_q}\"", f"", f"**Found:** {len(matches)}", ""]
+    lines.append("| Name | Father's Name | Class | Section | Category |")
+    lines.append("|------|--------------|-------|---------|----------|")
+    for s in matches[:30]:
+        lines.append(f"| {s['name']} | {s['father_name']} | {s['class']} | {s['section']} | {s['category']} |")
+
+    return "\n".join(lines)
+
+
+async def _answer_student_by_father(school_id: str, msg: str) -> str:
+    father_q = _extract_father_query(msg)
+    if not father_q:
+        return "Please specify a father's name to search for."
+
+    students = await _load_students(school_id)
+    matches = [s for s in students if father_q in s["father_name"].lower()]
+
+    if not matches:
+        return f"No students found with father's name matching **\"{father_q}\"**."
+
+    lines = [f"## Students with father's name \"{father_q}\"", f"", f"**Found:** {len(matches)}", ""]
+    lines.append("| Student Name | Father's Name | Class | Section | Category |")
+    lines.append("|-------------|--------------|-------|---------|----------|")
+    for s in matches[:30]:
+        lines.append(f"| {s['name']} | {s['father_name']} | {s['class']} | {s['section']} | {s['category']} |")
+
+    return "\n".join(lines)
+
+
+async def _answer_student_by_category(school_id: str, msg: str) -> str:
+    cat_q = _extract_category_query(msg)
+    students = await _load_students(school_id)
+
+    if cat_q:
+        matches = [s for s in students if s["category"].lower() == cat_q]
+        if not matches:
+            return f"No students found in category **{cat_q.upper()}**."
+
+        lines = [f"## {cat_q.upper()} Category Students", f"", f"**Total:** {len(matches)}", ""]
+        lines.append("| Name | Father's Name | Class | Section | Gender |")
+        lines.append("|------|--------------|-------|---------|--------|")
+        for s in matches[:30]:
+            lines.append(f"| {s['name']} | {s['father_name']} | {s['class']} | {s['section']} | {s['gender']} |")
+        return "\n".join(lines)
+
+    # No specific category — show breakdown
+    cats = _count_by(students, "category")
+    lines = [f"## Student Category Breakdown", f"", f"**Total Students:** {len(students)}", ""]
+    for k, v in sorted(cats.items()):
+        lines.append(f"- **{k or 'Unknown'}:** {v}")
+    return "\n".join(lines)
+
+
+async def _answer_class_strength(school_id: str, msg: str) -> str:
+    students = await _load_students(school_id)
+    classes = _count_by(students, "class")
+
+    lines = [f"## Class-wise Student Strength", f"", f"**Total Students:** {len(students)}", ""]
+    lines.append("| Class | Students |")
+    lines.append("|-------|----------|")
+    for k, v in sorted(classes.items()):
+        lines.append(f"| {k or 'Unknown'} | {v} |")
+
+    return "\n".join(lines)
+
+
+async def _answer_school_overview(school_id: str) -> str:
+    students = await _load_students(school_id)
+    teachers = await _load_teachers(school_id)
+
+    total_stu = len(students)
+    active_stu = sum(1 for s in students if s["active"])
+    total_tea = len(teachers)
+    active_tea = sum(1 for t in teachers if t.get("is_active", True))
+    cats = _count_by(students, "category")
+    classes = _count_by(students, "class")
+
+    lines = [
+        f"## School Overview",
+        f"",
+        f"### Students",
+        f"- **Total:** {total_stu} (Active: {active_stu})",
+    ]
+    for k, v in sorted(cats.items()):
+        lines.append(f"- **{k or 'Unknown'}:** {v}")
+    lines.append("")
+    lines.append("### Class-wise")
+    for k, v in sorted(classes.items()):
+        lines.append(f"- **{k or 'Unknown'}:** {v}")
+    lines.append("")
+    lines.append(f"### Teachers / Staff")
+    lines.append(f"- **Total:** {total_tea} (Active: {active_tea})")
+
+    return "\n".join(lines)
+
+
+# ===================================================================
+# Helpers
+# ===================================================================
+
+def _count_by(items: List[Dict[str, Any]], key: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in items:
+        val = item.get(key) or "Unknown"
+        counts[val] = counts.get(val, 0) + 1
+    return counts
+
+
+def _extract_name_query(msg: str) -> Optional[str]:
     patterns = [
-        f"{entity}s named ", f"{entity}s with name ", f"{entity} named ",
-        f"{entity} with name ", f"{entity}s of name ", f"name is ",
-        f"name ", f"named ",
+        "students named ", "student named ", "students with name ",
+        "student with name ", "students of name ", "student of name ",
+        "find student ", "search student ", "named ",
     ]
     for pat in patterns:
         idx = msg.find(pat)
         if idx != -1:
             rest = msg[idx + len(pat):].strip()
-            # Take first few words as the name
             words = rest.split()[:3]
             name = " ".join(words).strip("?.,! ")
             if name:
@@ -267,7 +382,7 @@ def _extract_name_query(msg: str, entity: str) -> Optional[str]:
 def _extract_father_query(msg: str) -> Optional[str]:
     patterns = [
         "father name is ", "father's name is ", "father name ",
-        "father's name ", "whose father ",
+        "father's name ", "whose father ", "papa ka naam ",
     ]
     for pat in patterns:
         idx = msg.find(pat)
@@ -282,8 +397,7 @@ def _extract_father_query(msg: str) -> Optional[str]:
 
 def _extract_category_query(msg: str) -> Optional[str]:
     categories = ["general", "obc", "sc", "st", "minor"]
-    # Check if asking about a specific category
     for cat in categories:
-        if f"category {cat}" in msg or f"{cat} category" in msg or f"of {cat}" in msg:
+        if f"category {cat}" in msg or f"{cat} category" in msg or f"of {cat}" in msg or f"{cat} student" in msg:
             return cat
     return None

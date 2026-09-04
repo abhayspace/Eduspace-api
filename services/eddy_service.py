@@ -10,7 +10,7 @@ from fastapi import HTTPException, status
 
 from config import get_settings
 from schemas.eddy import EddyChatIn, EddyChatMessage
-from services.eddy_school_data import ADMIN_ROLES, fetch_school_context
+from services.eddy_school_data import ADMIN_ROLES, try_admin_agent
 
 logger = logging.getLogger("eduspace.eddy")
 
@@ -37,10 +37,10 @@ LANGUAGE_GUIDE = {
 }
 
 
-def build_system_prompt(body: EddyChatIn, user: dict, school_context: str = "") -> str:
+def build_system_prompt(body: EddyChatIn, user: dict) -> str:
     name = (user.get("full_name") or "there").split()[0]
     role = user.get("role") or "user"
-    base = (
+    return (
         "You are Eddy, the AI Buddy for Eduspace School ERP — a helpful assistant for "
         "teachers, students, parents, and school admins in India.\n"
         f"The user's first name is {name}. Their role is {role}.\n"
@@ -52,18 +52,11 @@ def build_system_prompt(body: EddyChatIn, user: dict, school_context: str = "") 
         f"{LENGTH_GUIDE[body.length]}\n"
         f"{LANGUAGE_GUIDE[body.language]}\n"
     )
-    if school_context:
-        base += (
-            "\nWhen the user asks about school data (students, teachers, counts, etc.), "
-            "use ONLY the live data provided below. Do not make up numbers.\n"
-            + school_context
-        )
-    return base
 
 
-def to_groq_messages(body: EddyChatIn, user: dict, school_context: str = "") -> List[Dict[str, Any]]:
+def to_groq_messages(body: EddyChatIn, user: dict) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": build_system_prompt(body, user, school_context)},
+        {"role": "system", "content": build_system_prompt(body, user)},
     ]
     for item in body.history[-20:]:
         text = item.content.strip()
@@ -122,15 +115,17 @@ def _extract_text(payload: dict) -> str:
 
 
 async def generate_reply(body: EddyChatIn, user: dict) -> tuple[str, str]:
-    api_key, model = _require_groq()
-    school_context = ""
+    # Rule-based admin agent — bypasses LLM entirely
     if user.get("role") in ADMIN_ROLES and user.get("school_id"):
-        school_context = await fetch_school_context(user["school_id"], body.message)
-    logger.info("Eddy generate: role=%s school_id=%s context_len=%d",
-                user.get("role"), user.get("school_id"), len(school_context))
+        agent_reply = await try_admin_agent(user["school_id"], body.message)
+        if agent_reply:
+            logger.info("Eddy admin agent answered directly (no LLM)")
+            return agent_reply, "admin-agent"
+
+    api_key, model = _require_groq()
     payload = {
         "model": model,
-        "messages": to_groq_messages(body, user, school_context),
+        "messages": to_groq_messages(body, user),
         "temperature": 0.7,
         "max_completion_tokens": 2048 if body.length != "detailed" else 4096,
         "stream": False,
@@ -161,15 +156,18 @@ async def generate_reply(body: EddyChatIn, user: dict) -> tuple[str, str]:
 
 async def stream_reply(body: EddyChatIn, user: dict) -> AsyncIterator[str]:
     """Stream plain text chunks from Groq chat completions SSE."""
-    api_key, model = _require_groq()
-    school_context = ""
+    # Rule-based admin agent — yield entire reply in one chunk
     if user.get("role") in ADMIN_ROLES and user.get("school_id"):
-        school_context = await fetch_school_context(user["school_id"], body.message)
-    logger.info("Eddy stream: role=%s school_id=%s context_len=%d",
-                user.get("role"), user.get("school_id"), len(school_context))
+        agent_reply = await try_admin_agent(user["school_id"], body.message)
+        if agent_reply:
+            logger.info("Eddy admin agent answered directly (stream, no LLM)")
+            yield agent_reply
+            return
+
+    api_key, model = _require_groq()
     payload = {
         "model": model,
-        "messages": to_groq_messages(body, user, school_context),
+        "messages": to_groq_messages(body, user),
         "temperature": 0.7,
         "max_completion_tokens": 2048 if body.length != "detailed" else 4096,
         "stream": True,
