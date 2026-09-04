@@ -110,8 +110,8 @@ async def _to_public_enriched(user: dict) -> UserPublic:
                 payment_link = (school_row.get("payment_link") or "").strip()
                 sub_amount = float(school_row.get("subscription_amount") or 0)
                 updates["access_blocked"] = access_blocked
-                # Show popup if there is a payment link set by developer
-                if payment_link:
+                # Show popup only for school_admin when payment link is set
+                if payment_link and user.get("role") == "school_admin":
                     updates["subscription_popup"] = True
                     updates["subscription_amount"] = sub_amount
                     updates["payment_link"] = payment_link
