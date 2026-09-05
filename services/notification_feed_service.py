@@ -300,6 +300,7 @@ async def get_notification_feed(school_id: str, user: dict) -> List[Notification
         _appointments_feed(school_id, user),
         _fees_feed(school_id, user),
         _push_notifications_feed(school_id, user),
+        _force_update_feed(),
     )
     all_items: List[NotificationFeedItem] = []
     for batch in results:
@@ -307,6 +308,34 @@ async def get_notification_feed(school_id: str, user: dict) -> List[Notification
     # Sort by created_at descending
     all_items.sort(key=lambda x: x.created_at, reverse=True)
     return all_items[:100]  # cap at 100
+
+
+async def _force_update_feed() -> List[NotificationFeedItem]:
+    """Return a feed item when the developer has toggled force-update on."""
+    client = get_client()
+    res = (
+        await client.table("app_force_update")
+        .select("force_update,message,updated_at")
+        .eq("id", 1)
+        .limit(1)
+        .execute()
+    )
+    row = (res.data or [None])[0]
+    if not row or not row.get("force_update"):
+        return []
+    updated = row.get("updated_at")
+    created = datetime.fromisoformat(updated) if updated else datetime.now(timezone.utc)
+    return [NotificationFeedItem(
+        id="force-update",
+        type="notification",
+        title="App Update Available",
+        body=row.get("message") or "A new version of the app is available. Please update to the latest version.",
+        icon="download-cloud",
+        route=None,
+        is_read=False,
+        created_at=created,
+        metadata={"force_update": True},
+    )]
 
 
 async def _gather(*coros):

@@ -41,3 +41,18 @@ async def notification_feed(user: dict = Depends(current_user)) -> List[Notifica
     """Unified notification feed aggregating announcements, forms, quizzes,
     appointments/PTM, fees due, and push notifications."""
     return await get_notification_feed(user["school_id"], user)
+
+
+@router.put("/notifications/mark-all-read")
+async def mark_all_notifications_read(user: dict = Depends(current_user)) -> dict:
+    """Mark all push notifications as read for the current user."""
+    client = get_client()
+    await (
+        client.table("notifications")
+        .eq("school_id", user["school_id"])
+        .eq("user_id", user["id"])
+        .eq("is_read", False)
+        .update({"is_read": True})
+        .execute()
+    )
+    return {"status": "ok"}
