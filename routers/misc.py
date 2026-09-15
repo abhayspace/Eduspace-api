@@ -64,6 +64,7 @@ async def _student_attendance_report(school_id: str, days: int = 28) -> list:
 
     page_size = 1000
     offset = 0
+    total_rows = 0
     while True:
         res = (
             await client.table("attendance")
@@ -77,6 +78,7 @@ async def _student_attendance_report(school_id: str, days: int = 28) -> list:
             .execute()
         )
         rows = res.data or []
+        total_rows += len(rows)
         for row in rows:
             key = row.get("date")
             if key:
@@ -84,6 +86,22 @@ async def _student_attendance_report(school_id: str, days: int = 28) -> list:
         if len(rows) < page_size:
             break
         offset += page_size
+
+    print(f"[DEBUG attendance-report] school_id={school_id} days={days} total_present_rows={total_rows} today={today.isoformat()} present_today={present_by_date.get(today.isoformat(), 0)}")
+    print(f"[DEBUG attendance-report] present_by_date keys={list(present_by_date.keys())[-5:]} values={[present_by_date[k] for k in list(present_by_date.keys())[-5:]]}")
+
+    # Also count ALL attendance records for today (any status) to see what's in the DB
+    all_today = (
+        await client.table("attendance")
+        .select("status", count="exact")
+        .eq("school_id", school_id)
+        .eq("date", today.isoformat())
+        .execute()
+    )
+    status_counts: dict[str, int] = defaultdict(int)
+    for row in (all_today.data or []):
+        status_counts[row.get("status", "unknown")] += 1
+    print(f"[DEBUG attendance-report] ALL today records count={all_today.count} status_breakdown={dict(status_counts)}")
 
     points = []
     for offset in range(days):
@@ -106,14 +124,26 @@ async def student_attendance_report(
 ) -> dict:
     days = max(1, min(days, 400))
     school_id = user["school_id"]
+    client = get_client()
     points = await _student_attendance_report(school_id, days=days)
     payload: dict = {"points": points, "days": days}
 
     # Always include today's summary so Daily gauge works even when
     # the client requests 2+ days for day-over-day comparison.
     total = await _count_students(school_id)
+    today_iso = date.today().isoformat()
     present = points[-1]["present"] if points else 0
-    absent = max(total - present, 0)
+    # Count students on leave today so they aren't counted as absent
+    leave_res = (
+        await client.table("attendance")
+        .select("student_email", count="exact", head=True)
+        .eq("school_id", school_id)
+        .eq("date", today_iso)
+        .eq("status", "leave")
+        .execute()
+    )
+    leave_count = leave_res.count or 0
+    absent = max(total - present - leave_count, 0)
     pct = round((present / total) * 100) if total else 0
     payload["summary"] = {
         "total": total,

@@ -20,6 +20,36 @@ from services.teacher_service import _resolve_class_names
 _VALID_STATUSES = frozenset({"present", "absent", "leave"})
 
 
+async def _check_holiday_for_date(school_id: str, target_date: str) -> tuple[bool, Optional[str]]:
+    """Check if a given date falls within a holiday event in the school calendar.
+    Returns (is_holiday, holiday_title)."""
+    client = get_client()
+    res = (
+        await client.table("school_calendar_events")
+        .select("title,event_date,end_date")
+        .eq("school_id", school_id)
+        .eq("event_type", "holiday")
+        .lte("event_date", target_date)
+        .gte("end_date", target_date)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        # Also try events where end_date is null (single-day holidays)
+        res = (
+            await client.table("school_calendar_events")
+            .select("title,event_date,end_date")
+            .eq("school_id", school_id)
+            .eq("event_type", "holiday")
+            .eq("event_date", target_date)
+            .limit(1)
+            .execute()
+        )
+    if res.data:
+        return True, res.data[0].get("title") or "Holiday"
+    return False, None
+
+
 async def _class_teacher_profile(school_id: str, user_id: str) -> dict:
     client = get_client()
     res = (
@@ -64,12 +94,16 @@ async def list_my_class_attendance(user: dict, attendance_date: str) -> ClassStu
         class_name = class_name or ""
         section_name = section_name or ""
 
+    is_holiday, holiday_title = await _check_holiday_for_date(school_id, normalized_date)
+
     if not students:
         return ClassStudentAttendanceOut(
             class_name=class_name,
             section_name=section_name,
             date=normalized_date,
             students=[],
+            is_holiday=is_holiday,
+            holiday_title=holiday_title,
         )
 
     class_label = _class_label(class_name, section_name)
@@ -111,6 +145,8 @@ async def list_my_class_attendance(user: dict, attendance_date: str) -> ClassStu
         section_name=section_name or "",
         date=normalized_date,
         students=items,
+        is_holiday=is_holiday,
+        holiday_title=holiday_title,
     )
 
 

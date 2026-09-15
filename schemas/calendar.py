@@ -4,7 +4,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-CalendarEventType = Literal["holiday", "birthday", "special_day"]
+CalendarEventType = Literal["holiday", "birthday", "special_day", "event"]
 
 
 class CalendarEventOut(BaseModel):
@@ -14,6 +14,7 @@ class CalendarEventOut(BaseModel):
     description: Optional[str] = None
     event_date: date
     end_date: Optional[date] = None
+    repeat_yearly: bool = False
     source: str = "school"
     person_type: Optional[str] = None
     person_user_id: Optional[str] = None
@@ -33,6 +34,7 @@ class CalendarEventCreateIn(BaseModel):
     description: Optional[str] = Field(default=None, max_length=1000)
     event_date: date
     end_date: Optional[date] = None
+    repeat_yearly: bool = False
 
 
 class CalendarEventUpdateIn(BaseModel):
@@ -41,6 +43,7 @@ class CalendarEventUpdateIn(BaseModel):
     description: Optional[str] = Field(default=None, max_length=1000)
     event_date: Optional[date] = None
     end_date: Optional[date] = None
+    repeat_yearly: Optional[bool] = None
 
 
 class CalendarSettingsOut(BaseModel):

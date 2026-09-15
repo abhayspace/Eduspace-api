@@ -148,6 +148,8 @@ class ClassStudentAttendanceOut(BaseModel):
     section_name: str
     date: str
     students: List[ClassStudentAttendanceItem] = Field(default_factory=list)
+    is_holiday: bool = False
+    holiday_title: Optional[str] = None
 
 
 class ClassStudentAttendanceMarkIn(BaseModel):

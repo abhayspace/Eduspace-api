@@ -1,6 +1,7 @@
 """Aggregate recent school events for the admin home live activity feed."""
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
@@ -42,44 +43,86 @@ def _bucket_minute(ts: datetime, minutes: int = 10) -> datetime:
     return ts.replace(minute=(ts.minute // minutes) * minutes)
 
 
+async def _class_student_totals(school_id: str) -> Dict[str, int]:
+    """Build mapping from class_label (e.g. '10-A') to enrolled student count."""
+    client = get_client()
+    stu_res = await client.table("students").select("class_id,section_id").eq("school_id", school_id).execute()
+    cls_res = await client.table("classes").select("id,name").eq("school_id", school_id).execute()
+    class_by_id = {c["id"]: (c.get("name") or "") for c in (cls_res.data or [])}
+    sec_res = await client.table("sections").select("id,name,class_id").eq("school_id", school_id).execute()
+    section_by_id = {s["id"]: s for s in (sec_res.data or [])}
+
+    counts: Dict[str, int] = defaultdict(int)
+    for stu in (stu_res.data or []):
+        class_id = stu.get("class_id")
+        section_id = stu.get("section_id")
+        class_name = class_by_id.get(class_id, "")
+        section_name = ""
+        if section_id and section_id in section_by_id:
+            section_name = section_by_id[section_id].get("name") or ""
+        label = f"{class_name}-{section_name}" if section_name else class_name
+        counts[label] += 1
+    return dict(counts)
+
+
 async def _attendance_activities(school_id: str, since: datetime) -> List[dict]:
     client = get_client()
     res = (
         await client.table("attendance")
-        .select("class_name,date,marked_by,created_at")
+        .select("class_name,date,marked_by,created_at,student_email")
         .eq("school_id", school_id)
         .gte("created_at", since.isoformat())
         .order("created_at", desc=True)
         .limit(400)
         .execute()
     )
+
+    # Group by (class_name, date, marker) and track distinct student emails
     grouped: Dict[tuple, dict] = {}
     for row in res.data or []:
         created = _parse_ts(row.get("created_at"))
         class_name = (row.get("class_name") or "Class").strip() or "Class"
         marker = (row.get("marked_by") or "Teacher").strip() or "Teacher"
         date_label = str(row.get("date") or "")
-        bucket = _bucket_minute(created)
-        key = (class_name, date_label, marker, bucket.isoformat())
+        student_email = (row.get("student_email") or "").strip().lower()
+        key = (class_name, date_label, marker)
         entry = grouped.get(key)
         if not entry:
             grouped[key] = {
-                "id": f"attendance-{class_name}-{date_label}-{marker}-{bucket.isoformat()}",
+                "id": f"attendance-{class_name}-{date_label}-{marker}",
                 "type": "attendance_marked",
                 "title": f"Attendance taken for {class_name}",
                 "subtitle": f"{marker} · {date_label}",
                 "occurred_at": created,
                 "count": 1,
+                "emails": set(),
+                "class_name": class_name,
             }
         else:
             entry["count"] += 1
             if created > entry["occurred_at"]:
                 entry["occurred_at"] = created
-    out = list(grouped.values())
-    for item in out:
-        if item["count"] > 1:
-            item["subtitle"] = f"{item['subtitle']} · {item['count']} students"
-        del item["count"]
+        if student_email:
+            entry["emails"].add(student_email)
+
+    # Get total enrolled students per class label
+    class_totals = await _class_student_totals(school_id)
+
+    # Only include activities where >= 50% of class students are marked
+    out: List[dict] = []
+    for item in grouped.values():
+        marked_count = len(item["emails"])
+        total = class_totals.get(item["class_name"], 0)
+        del item["emails"]
+        del item["class_name"]
+        if total > 0 and marked_count >= total * 0.5:
+            if item["count"] > 1:
+                item["subtitle"] = f"{item['subtitle']} · {item['count']} students"
+            del item["count"]
+            out.append(item)
+        else:
+            del item["count"]
+
     return out
 
 

@@ -209,7 +209,7 @@ async def list_students(
             continue
         if search:
             q = search.lower()
-            hay = f"{user['full_name']} {p.get('admission_no','')} {p.get('roll_no','')}".lower()
+            hay = f"{user['full_name']} {p.get('admission_no','') or user.get('admission_no','')} {p.get('roll_no','')} {user.get('user_code','')}".lower()
             if q not in hay:
                 continue
         cn = class_names_map.get(p.get("class_id"))
@@ -286,11 +286,8 @@ async def create_student(
         pending_approval = False
         requested_by_user_id = None
     
-    user_code, default_adm, _ = await _next_student_codes(school_id)
-    if body.admission_no and body.admission_no.strip():
-        admission_no = normalize_admission_no(body.admission_no)
-    else:
-        admission_no = default_adm
+    user_code, _, _ = await _next_student_codes(school_id)
+    admission_no = body.admission_no.strip()
 
     if await _admission_taken(school_id, admission_no):
         raise HTTPException(status.HTTP_409_CONFLICT, "Admission number already used in this school")
@@ -544,10 +541,14 @@ async def update_student(school_id: str, student_id: str, body: StudentUpdateIn)
         user_updates["email"] = body.email.lower()
     if body.guardian_mobile:
         user_updates["mobile"] = body.guardian_mobile
+    if "admission_no" in body.model_fields_set:
+        user_updates["admission_no"] = body.admission_no.strip() if body.admission_no else None
     if user_updates:
         await client.table("users").update(user_updates).eq("id", profile["user_id"]).execute()
 
     profile_updates = {}
+    if "admission_no" in body.model_fields_set:
+        profile_updates["admission_no"] = body.admission_no.strip() if body.admission_no else None
     for field in (
         "gender", "dob", "father_name", "mother_name", "guardian_mobile",
         "address", "photo_url", "class_id", "section_id", "roll_no", "admission_date",
@@ -567,7 +568,16 @@ async def update_student(school_id: str, student_id: str, body: StudentUpdateIn)
         profile_updates["document_url"] = body.documents[0].document_url if body.documents else None
         profile_updates["document_name"] = body.documents[0].document_name if body.documents else None
     if profile_updates:
-        await client.table("students").update(profile_updates).eq("id", student_id).execute()
+        try:
+            await client.table("students").update(profile_updates).eq("id", student_id).execute()
+        except Exception as exc:
+            msg = str(exc)
+            if "uq_students_school_admission_no" in msg or "duplicate key value" in msg.lower():
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "This admission number is already assigned to another student.",
+                )
+            raise
 
     if body.full_name:
         await client.table("users").update({"full_name": body.full_name}).eq("id", profile["user_id"]).execute()

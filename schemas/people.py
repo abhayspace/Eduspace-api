@@ -182,7 +182,7 @@ class StudentMedicalVisitOut(BaseModel):
 
 
 class StudentCreateIn(BaseModel):
-    admission_no: Optional[str] = None
+    admission_no: str = Field(min_length=1)
     full_name: str = Field(min_length=1)
     gender: Optional[str] = None
     dob: Optional[date] = None
@@ -244,13 +244,14 @@ class StudentCreateIn(BaseModel):
 
 class StudentUpdateIn(BaseModel):
     full_name: Optional[str] = None
+    admission_no: Optional[str] = None
     gender: Optional[str] = None
     dob: Optional[date] = None
     father_name: Optional[str] = None
     mother_name: Optional[str] = None
     guardian_mobile: Optional[str] = None
     alternate_mobile: Optional[str] = None
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
     address: Optional[str] = None
     transport: Optional[str] = None
     class_id: Optional[str] = None

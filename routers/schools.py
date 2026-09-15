@@ -46,7 +46,7 @@ _SEARCH_COLUMNS = (
 _PROFILE_COLUMNS = (
     "id,school_name,institution_code,logo_url,address,city,state,pincode,"
     "email,phone,board,established_date,school_type,level_of_education,total_students,total_teachers,"
-    "principal_name,website,gst_number,subscription_plan,admin_email,admin_mobile"
+    "principal_name,website,gst_number,subscription_plan,display_plan,actual_plan,admin_email,admin_mobile,medium"
 )
 _PROFILE_COLUMNS_FALLBACK = (
     "id,school_name,institution_code,logo_url,address,city,state,pincode,"
@@ -70,7 +70,7 @@ async def _fetch_school_profile_row(school_id: str) -> dict:
     if not res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
     row = dict(res.data[0])
-    for col in ("established_date", "admin_email", "admin_mobile"):
+    for col in ("established_date", "admin_email", "admin_mobile", "medium", "display_plan", "actual_plan"):
         try:
             extra = (
                 await client.table("schools")
@@ -160,9 +160,12 @@ def _to_profile(row: dict, admin_user: Optional[dict] = None) -> SchoolProfileOu
         admin_name=_resolve_admin_display_name(row, admin_user),
         website=row.get("website"),
         gst_number=row.get("gst_number"),
-        subscription_plan=row.get("subscription_plan"),
+        subscription_plan=row.get("display_plan") or row.get("actual_plan") or row.get("subscription_plan"),
+        display_plan=row.get("display_plan"),
+        actual_plan=row.get("actual_plan"),
         admin_email=admin_email,
         admin_mobile=admin_mobile,
+        medium=row.get("medium"),
     )
 
 
@@ -720,7 +723,7 @@ async def all_school_stats(
             student_count=c["student"],
             teacher_count=c["teacher"],
             staff_count=c["staff"],
-            subscription_plan=s.get("subscription_plan"),
+            subscription_plan=s.get("display_plan") or s.get("actual_plan") or s.get("subscription_plan"),
         ))
     return results
 

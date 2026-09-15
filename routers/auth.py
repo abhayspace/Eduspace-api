@@ -27,7 +27,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger("eduspace.auth")
 
 _LOGIN_COLUMNS = (
-    "id,email,full_name,role,school_id,admission_no,user_code,is_active,password_hash,must_change_password,gender"
+    "id,email,full_name,role,school_id,admission_no,user_code,is_active,password_hash,must_change_password,gender,login_password"
 )
 
 
@@ -42,6 +42,25 @@ def _admission_match_clauses(ident: str) -> list[str]:
     else:
         clauses.append(f"admission_no.eq.{ident.upper()}")
     return list(dict.fromkeys(clauses))
+
+
+async def _check_login_password_fallback(client, user: dict, password: str) -> bool:
+    """Fallback: if bcrypt password_hash doesn't match, check plain-text login_password.
+
+    Migration 078 set login_password but didn't update password_hash. This allows
+    affected users to log in and migrates their password to bcrypt on success.
+    """
+    login_pw = user.get("login_password")
+    if not login_pw or password != login_pw:
+        return False
+    # Migrate to bcrypt hash so future logins use the normal path
+    try:
+        new_hash = hash_password(password)
+        await client.table("users").update({"password_hash": new_hash}).eq("id", user["id"]).execute()
+        logger.info("Migrated login_password to bcrypt for user_id=%s", user.get("id"))
+    except Exception:
+        logger.warning("Failed to migrate login_password for user_id=%s", user.get("id"))
+    return True
 
 
 def _to_public(user: dict) -> UserPublic:
@@ -156,7 +175,9 @@ async def login(body: LoginIn) -> TokenOut:
                 .execute()
             )
             user = legacy.data[0] if legacy.data else None
-        if not user or not verify_password(body.password, user.get("password_hash", "")):
+        if not user:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+        if not verify_password(body.password, user.get("password_hash", "")):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
     elif body.identifier and body.school_id:
         ident = body.identifier.strip()
@@ -197,7 +218,9 @@ async def login(body: LoginIn) -> TokenOut:
             .execute()
         )
         user = res.data[0] if res.data else None
-        if not user or not verify_password(body.password, user.get("password_hash", "")):
+        if not user:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+        if not verify_password(body.password, user.get("password_hash", "")):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
     else:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")

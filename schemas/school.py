@@ -141,6 +141,7 @@ class SchoolProfileOut(BaseModel):
     subscription_plan: Optional[str] = Field(default=None, alias="subscriptionPlan")
     admin_email: Optional[str] = Field(default=None, alias="adminEmail")
     admin_mobile: Optional[str] = Field(default=None, alias="adminMobile")
+    medium: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 

@@ -118,19 +118,10 @@ def normalize_admission_no(value: str) -> str:
     return raw.upper()
 
 
-def generate_temp_password(length: int = 12) -> str:
+def generate_temp_password(length: int = 8) -> str:
     """Return a cryptographically secure temporary password.
 
-    Guarantees at least one uppercase, lowercase, digit and special character.
+    Returns an 8-digit numeric string (digits only, no characters).
     """
-    length = max(10, length)
-    alphabet = string.ascii_letters + string.digits + _PW_SPECIAL
-    while True:
-        pw = "".join(secrets.choice(alphabet) for _ in range(length))
-        if (
-            any(c.isupper() for c in pw)
-            and any(c.islower() for c in pw)
-            and any(c.isdigit() for c in pw)
-            and any(c in _PW_SPECIAL for c in pw)
-        ):
-            return pw
+    length = max(8, length)
+    return "".join(secrets.choice(string.digits) for _ in range(length))

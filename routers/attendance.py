@@ -1,10 +1,13 @@
 """Attendance records (scoped per school)."""
+from datetime import date, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 
 from database import get_client
 from schemas.content import (
+    Announcement,
     AttendanceRec,
     ClassStudentAttendanceMarkIn,
     ClassStudentAttendanceOut,
@@ -13,6 +16,7 @@ from schemas.content import (
     StaffAttendanceSummaryOut,
 )
 from services import class_student_attendance_service, staff_attendance_service
+from services.notification_service import notify_school
 from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/attendance", tags=["attendance"])
@@ -242,3 +246,197 @@ async def my_student_attendance_summary(
         month=month,
         year=year,
     )
+
+
+# ── Holiday confirmation ──────────────────────────────────────────────
+_ADMIN_ROLES = ("school_admin", "principal", "vice_principal", "super_admin")
+
+
+class HolidayCheckOut(BaseModel):
+    has_holiday_tomorrow: bool
+    holiday_title: Optional[str] = None
+    holiday_date: Optional[str] = None
+    already_confirmed: bool = False
+
+
+class HolidayConfirmIn(BaseModel):
+    holiday_date: str
+    holiday_title: str = "Holiday"
+
+
+@router.get("/holiday-check", response_model=HolidayCheckOut)
+async def check_tomorrow_holiday(
+    user: dict = Depends(require_roles(*_ADMIN_ROLES)),
+) -> HolidayCheckOut:
+    """Check if tomorrow is a holiday in the school calendar and whether
+    an announcement has already been created for it."""
+    school_id = user["school_id"]
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+
+    client = get_client()
+    # Check if tomorrow is a holiday
+    res = (
+        await client.table("school_calendar_events")
+        .select("title,event_date,end_date")
+        .eq("school_id", school_id)
+        .eq("event_type", "holiday")
+        .lte("event_date", tomorrow)
+        .gte("end_date", tomorrow)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        res = (
+            await client.table("school_calendar_events")
+            .select("title,event_date,end_date")
+            .eq("school_id", school_id)
+            .eq("event_type", "holiday")
+            .eq("event_date", tomorrow)
+            .limit(1)
+            .execute()
+        )
+    if not res.data:
+        return HolidayCheckOut(has_holiday_tomorrow=False)
+
+    holiday_title = res.data[0].get("title") or "Holiday"
+
+    # Check if an announcement was already created for this holiday
+    today_start = f"{date.today()}T00:00:00+00:00"
+    today_end = f"{date.today()}T23:59:59.999999+00:00"
+    ann_res = (
+        await client.table("announcements")
+        .select("id")
+        .eq("school_id", school_id)
+        .ilike("title", f"%{holiday_title}%")
+        .gte("created_at", today_start)
+        .lte("created_at", today_end)
+        .limit(1)
+        .execute()
+    )
+    already_confirmed = bool(ann_res.data)
+
+    return HolidayCheckOut(
+        has_holiday_tomorrow=True,
+        holiday_title=holiday_title,
+        holiday_date=tomorrow,
+        already_confirmed=already_confirmed,
+    )
+
+
+@router.post("/holiday-confirm", response_model=Announcement)
+async def confirm_holiday(
+    body: HolidayConfirmIn,
+    user: dict = Depends(require_roles(*_ADMIN_ROLES)),
+) -> Announcement:
+    """Confirm a holiday by creating an announcement for all teachers and students.
+    This ensures attendance is not counted as a working day."""
+    school_id = user["school_id"]
+    client = get_client()
+
+    # Check if announcement already exists for today
+    today_start = f"{date.today()}T00:00:00+00:00"
+    today_end = f"{date.today()}T23:59:59.999999+00:00"
+    existing = (
+        await client.table("announcements")
+        .select("id")
+        .eq("school_id", school_id)
+        .ilike("title", f"%{body.holiday_title}%")
+        .gte("created_at", today_start)
+        .lte("created_at", today_end)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Holiday announcement already created")
+
+    title = f"Holiday Confirmation: {body.holiday_title}"
+    body_text = (
+        f"This is to confirm that {body.holiday_date} is a holiday ({body.holiday_title}).\n"
+        f"Attendance will not be marked on this day.\n"
+        f"Enjoy your day off!"
+    )
+
+    row = {
+        "school_id": school_id,
+        "title": title,
+        "body": body_text,
+        "audience": "all",
+        "author": user.get("full_name") or "School Admin",
+    }
+    inserted = await client.table("announcements").insert(row).execute()
+    if not inserted.data:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create announcement")
+
+    created = Announcement(**inserted.data[0])
+    await notify_school(school_id, f"Holiday Confirmation: {body.holiday_title}", body_text)
+    return created
+
+
+class DayHolidayCheckOut(BaseModel):
+    is_holiday: bool
+    holiday_title: Optional[str] = None
+    holiday_id: Optional[str] = None
+
+
+@router.get("/day-holiday-check", response_model=DayHolidayCheckOut)
+async def check_day_holiday(
+    day: str = Query(..., description="YYYY-MM-DD"),
+    user: dict = Depends(require_roles(*_ADMIN_ROLES)),
+) -> DayHolidayCheckOut:
+    """Check if a specific date is a holiday in the school calendar."""
+    school_id = user["school_id"]
+    client = get_client()
+
+    res = (
+        await client.table("school_calendar_events")
+        .select("id,title,event_date,end_date")
+        .eq("school_id", school_id)
+        .eq("event_type", "holiday")
+        .lte("event_date", day)
+        .gte("end_date", day)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        res = (
+            await client.table("school_calendar_events")
+            .select("id,title,event_date,end_date")
+            .eq("school_id", school_id)
+            .eq("event_type", "holiday")
+            .eq("event_date", day)
+            .limit(1)
+            .execute()
+        )
+    if not res.data:
+        return DayHolidayCheckOut(is_holiday=False)
+    return DayHolidayCheckOut(
+        is_holiday=True,
+        holiday_title=res.data[0].get("title") or "Holiday",
+        holiday_id=res.data[0].get("id"),
+    )
+
+
+class RemoveHolidayIn(BaseModel):
+    holiday_id: str
+
+
+@router.delete("/day-holiday")
+async def remove_day_holiday(
+    body: RemoveHolidayIn,
+    user: dict = Depends(require_roles(*_ADMIN_ROLES)),
+):
+    """Remove a holiday event from the school calendar (make it a working day)."""
+    school_id = user["school_id"]
+    client = get_client()
+
+    deleted = (
+        await client.table("school_calendar_events")
+        .delete()
+        .eq("id", body.holiday_id)
+        .eq("school_id", school_id)
+        .eq("event_type", "holiday")
+        .execute()
+    )
+    if not deleted.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Holiday event not found")
+    return {"ok": True, "message": "Holiday removed. The day is now a working day."}

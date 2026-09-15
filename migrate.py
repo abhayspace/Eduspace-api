@@ -88,6 +88,9 @@ MIGRATION_ORDER = [
     "073_force_update.sql",
     "074_leave_requests_reviewer.sql",
     "075_messages_reply_to_id.sql",
+    "076_school_subscription_management.sql",
+    "077_subscription_dates_billing.sql",
+    "078_student_numeric_passwords.sql",
 ]
 
 

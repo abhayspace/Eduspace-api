@@ -18,7 +18,7 @@ from schemas.calendar import (
     CalendarSettingsOut,
 )
 
-_COLUMNS = "id,school_id,event_type,title,description,event_date,end_date,created_by,created_at"
+_COLUMNS = "id,school_id,event_type,title,description,event_date,end_date,repeat_yearly,created_by,created_at"
 
 
 def _month_bounds(month: int, year: int) -> tuple[date, date]:
@@ -42,6 +42,7 @@ def _row_to_event(row: dict, *, source: str = "school", person_type: Optional[st
         description=row.get("description"),
         event_date=row["event_date"],
         end_date=row.get("end_date"),
+        repeat_yearly=bool(row.get("repeat_yearly") or False),
         source=source,
         person_type=person_type,
         created_by=row.get("created_by"),
@@ -217,20 +218,41 @@ async def _profile_birthdays(school_id: str, month: int, year: int, user: dict) 
         fetch_students(), fetch_teachers(), fetch_staff(),
     )
 
+    print(f"[DEBUG birthdays] school_id={school_id} month={month} year={year} role={role}")
+    print(f"[DEBUG birthdays] student_rows={len(student_rows)} teacher_rows={len(teacher_rows)} staff_rows={len(staff_rows)}")
+    if student_rows:
+        print(f"[DEBUG birthdays] sample student row: {student_rows[0]}")
+    if teacher_rows:
+        print(f"[DEBUG birthdays] sample teacher row: {teacher_rows[0]}")
+
     # Collect all user_ids for batched users query
     all_user_ids: list[str] = []
     for rows in (student_rows, teacher_rows, staff_rows):
         all_user_ids.extend(row.get("user_id") for row in rows if row.get("user_id"))
+    all_user_ids = list(set(all_user_ids))
 
     users_by_id: dict[str, dict] = {}
     if all_user_ids:
-        users_res = (
-            await client.table("users")
-            .select("id,full_name,dob")
-            .in_("id", all_user_ids)
-            .execute()
-        )
-        users_by_id = {row["id"]: row for row in (users_res.data or [])}
+        # Chunk the in_ query to avoid Supabase/PostgREST limits on large arrays
+        CHUNK_SIZE = 500
+        for i in range(0, len(all_user_ids), CHUNK_SIZE):
+            chunk = all_user_ids[i:i + CHUNK_SIZE]
+            try:
+                users_res = (
+                    await client.table("users")
+                    .select("id,full_name,dob")
+                    .in_("id", chunk)
+                    .execute()
+                )
+                for row in (users_res.data or []):
+                    users_by_id[row["id"]] = row
+            except Exception:
+                pass
+
+    print(f"[DEBUG birthdays] all_user_ids count={len(all_user_ids)} users_by_id count={len(users_by_id)}")
+    if users_by_id:
+        sample_uid = list(users_by_id.keys())[0]
+        print(f"[DEBUG birthdays] sample user: {users_by_id[sample_uid]}")
 
     def _make_birthday(person_type: str, rows: list[dict]) -> None:
         for row in rows:
@@ -238,6 +260,7 @@ async def _profile_birthdays(school_id: str, month: int, year: int, user: dict) 
             u = users_by_id.get(user_id or "", {})
             dob_raw = row.get("dob") or u.get("dob")
             if not dob_raw:
+                print(f"[DEBUG birthdays] SKIP {person_type} user_id={user_id} — no dob (row.dob={row.get('dob')}, user.dob={u.get('dob')})")
                 continue
             if isinstance(dob_raw, str):
                 dob = date.fromisoformat(dob_raw[:10])
@@ -285,14 +308,47 @@ async def list_month(school_id: str, month: int, year: int, user: dict) -> Calen
         .gte("end_date", month_start.isoformat())
         .execute()
     )
+    # Also fetch yearly-repeating events that may originate from a different year
+    repeat_res = (
+        await client.table("school_calendar_events")
+        .select(_COLUMNS)
+        .eq("school_id", school_id)
+        .eq("repeat_yearly", True)
+        .execute()
+    )
+    # Merge results, dedup by id
+    seen_ids: set[str] = set()
+    all_rows: list[dict] = []
+    for row in (res.data or []) + (repeat_res.data or []):
+        rid = row.get("id")
+        if rid and rid not in seen_ids:
+            seen_ids.add(rid)
+            all_rows.append(row)
+
     school_events: List[CalendarEventOut] = []
-    for row in res.data or []:
+    for row in all_rows:
         event_date = date.fromisoformat(str(row["event_date"])[:10])
         end_date_raw = row.get("end_date")
         end_date = date.fromisoformat(str(end_date_raw)[:10]) if end_date_raw else None
         event_end = end_date or event_date
         if event_date <= month_end and event_end >= month_start:
             school_events.append(_row_to_event(row))
+            continue
+
+        # Repeat yearly: shift the event's year to match the requested year
+        if row.get("repeat_yearly"):
+            try:
+                shifted_start = date(year, event_date.month, event_date.day)
+            except ValueError:
+                continue  # e.g. Feb 29 on a non-leap year
+            try:
+                shifted_end = date(year, end_date.month, end_date.day) if end_date else None
+            except ValueError:
+                shifted_end = None
+            shifted_end_val = shifted_end or shifted_start
+            if shifted_start <= month_end and shifted_end_val >= month_start:
+                shifted_row = {**row, "event_date": shifted_start.isoformat(), "end_date": shifted_end.isoformat() if shifted_end else None}
+                school_events.append(_row_to_event(shifted_row))
 
     profile_events = await _profile_birthdays(school_id, month, year, user)
     combined = school_events + profile_events
@@ -327,6 +383,7 @@ async def create_event(school_id: str, body: CalendarEventCreateIn, created_by: 
         "description": (body.description or "").strip() or None,
         "event_date": body.event_date.isoformat(),
         "end_date": body.end_date.isoformat() if body.end_date else None,
+        "repeat_yearly": body.repeat_yearly,
         "created_by": created_by,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -360,6 +417,8 @@ async def update_event(
         updates["event_date"] = body.event_date.isoformat()
     if body.end_date is not None:
         updates["end_date"] = body.end_date.isoformat() if body.end_date else None
+    if body.repeat_yearly is not None:
+        updates["repeat_yearly"] = body.repeat_yearly
 
     client = get_client()
     res = (

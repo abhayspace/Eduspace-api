@@ -229,7 +229,7 @@ async def create_student(
 async def update_student(
     student_id: str,
     body: StudentUpdateIn,
-    user: dict = Depends(require_roles("school_admin", "principal")),
+    user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "super_admin")),
 ) -> StudentOut:
     return await student_service.update_student(user["school_id"], student_id, body)
 
