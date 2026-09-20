@@ -67,7 +67,7 @@ class ChangePasswordIn(BaseModel):
 
 class ParentSetupIn(BaseModel):
     """First-login parent account setup: own password + recovery Gmail."""
-    password: str = Field(min_length=6)
+    password: str = Field(min_length=8)
     email: str = Field(min_length=3)
 
 
