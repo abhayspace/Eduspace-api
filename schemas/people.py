@@ -2,7 +2,7 @@
 from datetime import date, datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_serializer, field_validator, model_validator
 
 
 class CredentialsOut(BaseModel):
@@ -324,6 +324,7 @@ class StudentOut(BaseModel):
     section_id: Optional[str] = None
     class_name: Optional[str] = None
     section_name: Optional[str] = None
+    class_teacher_name: Optional[str] = None
     roll_no: Optional[str] = None
     admission_date: Optional[date] = None
     photo_url: Optional[str] = None
@@ -336,6 +337,14 @@ class StudentOut(BaseModel):
     document_url: Optional[str] = None
     document_name: Optional[str] = None
     approval_status: str = "approved"
+
+    @field_serializer("email")
+    def _mask_generated_email(self, value: Optional[str]) -> Optional[str]:
+        # Auto-generated placeholder emails (student_*@eduspace.local) are
+        # internal login/attendance identifiers — never show them to users.
+        if value and value.endswith("@eduspace.local"):
+            return None
+        return value
 
 
 class StudentCreateOut(BaseModel):

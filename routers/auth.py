@@ -177,7 +177,7 @@ async def login(body: LoginIn) -> TokenOut:
             user = legacy.data[0] if legacy.data else None
         if not user:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
-        if not verify_password(body.password, user.get("password_hash", "")):
+        if not verify_password(body.password, user.get("password_hash", "")) and not await _check_login_password_fallback(client, user, body.password):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
     elif body.identifier and body.school_id:
         ident = body.identifier.strip()
@@ -204,11 +204,12 @@ async def login(body: LoginIn) -> TokenOut:
             )
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
         if not verify_password(body.password, user.get("password_hash", "")):
-            logger.warning(
-                "Login failed: password mismatch for user_id=%s identifier=%r role=%s",
-                user.get("id"), ident, user.get("role"),
-            )
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+            if not await _check_login_password_fallback(client, user, body.password):
+                logger.warning(
+                    "Login failed: password mismatch for user_id=%s identifier=%r role=%s",
+                    user.get("id"), ident, user.get("role"),
+                )
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
     elif body.email:
         res = (
             await client.table("users")
@@ -220,7 +221,7 @@ async def login(body: LoginIn) -> TokenOut:
         user = res.data[0] if res.data else None
         if not user:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
-        if not verify_password(body.password, user.get("password_hash", "")):
+        if not verify_password(body.password, user.get("password_hash", "")) and not await _check_login_password_fallback(client, user, body.password):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
     else:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")

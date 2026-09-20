@@ -1,5 +1,6 @@
 """Student CRUD with user account provisioning."""
 import logging
+import secrets
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -127,7 +128,41 @@ async def _resolve_class_section(school_id: str, class_id: Optional[str], sectio
     return class_name, section_name
 
 
-def _build_student_out(user: dict, profile: dict, class_name: Optional[str] = None, section_name: Optional[str] = None) -> StudentOut:
+async def _resolve_class_teacher_name(
+    school_id: str,
+    class_id: Optional[str],
+    section_id: Optional[str],
+) -> Optional[str]:
+    """Full name of the teacher marked class teacher for this class/section."""
+    if not class_id:
+        return None
+    client = get_client()
+    query = (
+        client.table("teachers")
+        .select("user_id")
+        .eq("school_id", school_id)
+        .eq("is_class_teacher", True)
+        .eq("class_teacher_class_id", class_id)
+    )
+    if section_id:
+        query = query.eq("class_teacher_section_id", section_id)
+    res = await query.limit(1).execute()
+    if not res.data:
+        return None
+    teacher_user_id = res.data[0].get("user_id")
+    if not teacher_user_id:
+        return None
+    user_res = (
+        await client.table("users")
+        .select("full_name")
+        .eq("id", teacher_user_id)
+        .limit(1)
+        .execute()
+    )
+    return user_res.data[0].get("full_name") if user_res.data else None
+
+
+def _build_student_out(user: dict, profile: dict, class_name: Optional[str] = None, section_name: Optional[str] = None, class_teacher_name: Optional[str] = None) -> StudentOut:
     return StudentOut(
         id=profile["id"],
         user_id=user["id"],
@@ -147,6 +182,7 @@ def _build_student_out(user: dict, profile: dict, class_name: Optional[str] = No
         section_id=profile.get("section_id"),
         class_name=class_name,
         section_name=section_name,
+        class_teacher_name=class_teacher_name,
         roll_no=profile.get("roll_no"),
         admission_date=profile.get("admission_date"),
         photo_url=profile.get("photo_url") or user.get("photo_url"),
@@ -252,7 +288,8 @@ async def get_student_by_user_id(school_id: str, user_id: str) -> StudentOut:
     if not user_res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Student user not found")
     cn, sn = await _resolve_class_section(school_id, profile.get("class_id"), profile.get("section_id"))
-    return _build_student_out(user_res.data[0], profile, cn, sn)
+    ct_name = await _resolve_class_teacher_name(school_id, profile.get("class_id"), profile.get("section_id"))
+    return _build_student_out(user_res.data[0], profile, cn, sn, ct_name)
 
 
 async def create_student(
@@ -318,7 +355,13 @@ async def create_student(
                     "A student with the same name, parent name and contact already exists",
                 )
 
-    email = (body.email or f"student_{admission_no}_{school_id[:8]}@eduspace.local").lower()
+    # Placeholder email must be unique by construction — a student's
+    # admission_no can be edited later, leaving a stale email that would
+    # block re-using that admission number (uq_users_school_email).
+    email = (
+        body.email
+        or f"student_{user_code}_{school_id[:8]}_{secrets.token_hex(4)}@eduspace.local"
+    ).lower()
 
     if body.email:
         existing = (
