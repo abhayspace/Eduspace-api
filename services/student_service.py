@@ -290,12 +290,59 @@ async def get_student_by_user_id(school_id: str, user_id: str) -> StudentOut:
             .limit(1)
             .execute()
         )
-        if link.data:
+        student_id = link.data[0]["student_id"] if link.data else None
+        if not student_id:
+            # Self-heal: the parent account shares the student's admission_no —
+            # recover the link if the parents row was never written.
+            parent_user = (
+                await client.table("users")
+                .select("role,admission_no")
+                .eq("id", user_id)
+                .limit(1)
+                .execute()
+            )
+            if (
+                parent_user.data
+                and parent_user.data[0].get("role") == "parent"
+                and parent_user.data[0].get("admission_no")
+            ):
+                student_user = (
+                    await client.table("users")
+                    .select("id")
+                    .eq("school_id", school_id)
+                    .eq("role", "student")
+                    .eq("admission_no", parent_user.data[0]["admission_no"])
+                    .limit(1)
+                    .execute()
+                )
+                if student_user.data:
+                    sp = (
+                        await client.table("students")
+                        .select("id")
+                        .eq("school_id", school_id)
+                        .eq("user_id", student_user.data[0]["id"])
+                        .limit(1)
+                        .execute()
+                    )
+                    if sp.data:
+                        student_id = sp.data[0]["id"]
+                        try:
+                            await client.table("parents").insert(
+                                {
+                                    "school_id": school_id,
+                                    "user_id": user_id,
+                                    "student_id": student_id,
+                                    "relation": "guardian",
+                                }
+                            ).execute()
+                        except Exception:
+                            pass
+        if student_id:
             res = (
                 await client.table("students")
                 .select("*")
                 .eq("school_id", school_id)
-                .eq("id", link.data[0]["student_id"])
+                .eq("id", student_id)
                 .limit(1)
                 .execute()
             )
