@@ -106,6 +106,21 @@ async def _find_student(school_id: str, admission_no: str) -> dict | None:
     return res.data[0] if res.data else None
 
 
+async def _find_parent(school_id: str, admission_no: str) -> dict | None:
+    client = get_client()
+    clauses = _admission_match_clauses(admission_no)
+    res = (
+        await client.table("users")
+        .select("id,email,full_name,role,school_id,admission_no,user_code,is_active")
+        .eq("school_id", school_id)
+        .eq("role", "parent")
+        .or_(",".join(clauses))
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
 async def _find_staff(school_id: str, user_id: str) -> dict | None:
     client = get_client()
     code = user_id.strip().upper()
@@ -253,6 +268,39 @@ async def student_reset_password(body: StudentForgotResetIn) -> dict:
     user, email = _require_gmail(
         await _find_student(body.school_id, body.admission_no),
         "Student not found.",
+    )
+    return await _reset_password(user, email, body.new_password)
+
+
+# ── Parent ────────────────────────────────────────────────────────────────────
+
+@router.post("/parent/send-otp", response_model=StudentForgotSendOut)
+async def parent_send_otp(body: StudentForgotSendIn) -> StudentForgotSendOut:
+    user = await _find_parent(body.school_id, body.admission_no)
+    if not user or not user.get("is_active", True):
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "No parent account found with this admission number for your school.",
+        )
+    return await _send_forgot_otp(user)
+
+
+@router.post("/parent/verify-otp")
+async def parent_verify_otp(body: StudentForgotVerifyIn) -> dict:
+    user, email = _require_gmail(
+        await _find_parent(body.school_id, body.admission_no),
+        "Parent account not found.",
+    )
+    if not verify(email, body.otp, purpose=_OTP_PURPOSE):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired OTP. Please request a new one.")
+    return {"verified": True, "masked_email": mask_email(email)}
+
+
+@router.post("/parent/reset-password")
+async def parent_reset_password(body: StudentForgotResetIn) -> dict:
+    user, email = _require_gmail(
+        await _find_parent(body.school_id, body.admission_no),
+        "Parent account not found.",
     )
     return await _reset_password(user, email, body.new_password)
 

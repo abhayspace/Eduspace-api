@@ -25,6 +25,40 @@ _COLUMNS = "id,school_id,student_email,class_name,date,status"
 _STAFF_MARK_ROLES = ("teacher", "principal", "school_admin", "vice_principal", "super_admin")
 
 
+async def _student_email_for_user(user: dict) -> str:
+    """Resolve the attendance student_email — parents map to their linked child."""
+    if user.get("role") != "parent":
+        return user["email"]
+    client = get_client()
+    link = (
+        await client.table("parents")
+        .select("student_id")
+        .eq("school_id", user["school_id"])
+        .eq("user_id", user["id"])
+        .limit(1)
+        .execute()
+    )
+    if not link.data:
+        return user["email"]
+    student = (
+        await client.table("students")
+        .select("user_id")
+        .eq("id", link.data[0]["student_id"])
+        .limit(1)
+        .execute()
+    )
+    if not student.data:
+        return user["email"]
+    student_user = (
+        await client.table("users")
+        .select("email")
+        .eq("id", student.data[0]["user_id"])
+        .limit(1)
+        .execute()
+    )
+    return student_user.data[0]["email"] if student_user.data else user["email"]
+
+
 @router.get("/me", response_model=List[AttendanceRec])
 async def my_attendance(user: dict = Depends(current_user)) -> List[AttendanceRec]:
     client = get_client()
@@ -32,7 +66,7 @@ async def my_attendance(user: dict = Depends(current_user)) -> List[AttendanceRe
         await client.table("attendance")
         .select(_COLUMNS)
         .eq("school_id", user["school_id"])
-        .eq("student_email", user["email"])
+        .eq("student_email", await _student_email_for_user(user))
         .order("date", desc=True)
         .limit(100)
         .execute()

@@ -10,6 +10,7 @@ from schemas.auth import (
     DeveloperForgotVerifyIn,
     DeveloperLoginIn,
     LoginIn,
+    ParentSetupIn,
     RegisterIn,
     TokenOut,
     UserPublic,
@@ -74,6 +75,7 @@ def _to_public(user: dict) -> UserPublic:
         user_code=user.get("user_code"),
         is_active=user.get("is_active", True),
         gender=user.get("gender"),
+        must_change_password=bool(user.get("must_change_password")),
     )
 
 
@@ -141,6 +143,123 @@ async def _to_public_enriched(user: dict) -> UserPublic:
     return base.model_copy(update=updates) if updates else base
 
 
+async def _create_parent_account(client, school_id: str, student_user: dict) -> dict:
+    """Lazily create the parent account for a student (first parent login).
+
+    The parent signs in with the student's admission number + password once;
+    this creates the linked parent user (must_change_password=True) so the
+    app can force the password + Gmail setup.
+    """
+    student_profile = (
+        await client.table("students")
+        .select("id")
+        .eq("school_id", school_id)
+        .eq("user_id", student_user["id"])
+        .limit(1)
+        .execute()
+    )
+    if not student_profile.data:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+    student_id = student_profile.data[0]["id"]
+
+    email = f"parent_{(student_user.get('admission_no') or student_user['id'])}@eduspace.local".lower()
+    row = {
+        "email": email,
+        "full_name": f"Parent of {student_user.get('full_name') or 'Student'}",
+        "role": "parent",
+        "school_id": school_id,
+        "admission_no": student_user.get("admission_no"),
+        "is_active": True,
+        "must_change_password": True,
+        "password_hash": student_user.get("password_hash", ""),
+    }
+    try:
+        inserted = await client.table("users").insert(row).execute()
+    except Exception:
+        # Likely an email unique-conflict from a previous partial attempt —
+        # recover the existing parent row instead of failing the login.
+        existing = (
+            await client.table("users")
+            .select(_LOGIN_COLUMNS)
+            .eq("school_id", school_id)
+            .eq("role", "parent")
+            .eq("email", email)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise
+        parent = existing.data[0]
+    else:
+        if not inserted.data:
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create parent account")
+        parent = inserted.data[0]
+
+    try:
+        await client.table("parents").insert(
+            {
+                "school_id": school_id,
+                "user_id": parent["id"],
+                "student_id": student_id,
+                "relation": "guardian",
+            }
+        ).execute()
+    except Exception:
+        pass  # link may already exist
+    return parent
+
+
+async def _resolve_parent_login(client, body: LoginIn, ident: str) -> dict:
+    """Parent login: own password after setup, student password for first login."""
+    adm_clauses = _admission_match_clauses(ident)
+    or_parts = [
+        f"email.eq.{ident.lower()}",
+        f"user_code.eq.{ident.upper()}",
+        *adm_clauses,
+    ]
+
+    parent_res = (
+        await client.table("users")
+        .select(_LOGIN_COLUMNS)
+        .eq("school_id", body.school_id)
+        .eq("role", "parent")
+        .or_(",".join(or_parts))
+        .limit(1)
+        .execute()
+    )
+    parent = parent_res.data[0] if parent_res.data else None
+
+    # Completed setup → normal password check against the parent's account.
+    if parent and not parent.get("must_change_password"):
+        if verify_password(body.password, parent.get("password_hash", "")) or await _check_login_password_fallback(
+            client, parent, body.password
+        ):
+            return parent
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+
+    # First login (or setup still pending) → verify against the student's password.
+    student_res = (
+        await client.table("users")
+        .select(_LOGIN_COLUMNS)
+        .eq("school_id", body.school_id)
+        .eq("role", "student")
+        .or_(",".join(or_parts))
+        .limit(1)
+        .execute()
+    )
+    student = student_res.data[0] if student_res.data else None
+    if not student:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+    if not verify_password(body.password, student.get("password_hash", "")) and not await _check_login_password_fallback(
+        client, student, body.password
+    ):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+
+    if parent:
+        return parent  # setup pending — student password still accepted
+    return await _create_parent_account(client, body.school_id, student)
+
+
 @router.post("/login", response_model=TokenOut)
 async def login(body: LoginIn) -> TokenOut:
     client = get_client()
@@ -179,6 +298,8 @@ async def login(body: LoginIn) -> TokenOut:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
         if not verify_password(body.password, user.get("password_hash", "")) and not await _check_login_password_fallback(client, user, body.password):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
+    elif body.identifier and body.school_id and body.role == "parent":
+        user = await _resolve_parent_login(client, body, body.identifier.strip())
     elif body.identifier and body.school_id:
         ident = body.identifier.strip()
         adm_clauses = _admission_match_clauses(ident)
@@ -413,6 +534,56 @@ async def link_email(
     updated = (
         await client.table("users")
         .update({"email": email})
+        .eq("id", user["id"])
+        .execute()
+    )
+    if not updated.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    return await _to_public_enriched(updated.data[0])
+
+
+@router.post("/parent-setup", response_model=UserPublic)
+async def parent_setup(
+    body: ParentSetupIn,
+    user: dict = Depends(current_user),
+) -> UserPublic:
+    """Mandatory first-login setup for parents: own password + recovery Gmail."""
+    if user.get("role") != "parent":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only parent accounts can use this endpoint")
+
+    email = body.email.strip().lower()
+    if not is_gmail(email):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Please enter a valid Gmail address (e.g. you@gmail.com).",
+        )
+
+    client = get_client()
+    existing = (
+        await client.table("users")
+        .select("id")
+        .eq("school_id", user["school_id"])
+        .eq("email", email)
+        .neq("id", user["id"])
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This Gmail is already linked to another account.",
+        )
+
+    updated = (
+        await client.table("users")
+        .update(
+            {
+                "password_hash": hash_password(body.password),
+                "login_password": body.password,
+                "email": email,
+                "must_change_password": False,
+            }
+        )
         .eq("id", user["id"])
         .execute()
     )

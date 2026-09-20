@@ -280,6 +280,26 @@ async def get_student_by_user_id(school_id: str, user_id: str) -> StudentOut:
         .execute()
     )
     if not res.data:
+        # Parents resolve to their linked student's profile so the app shows
+        # the child's data (profile, homework, timetable, etc.).
+        link = (
+            await client.table("parents")
+            .select("student_id")
+            .eq("school_id", school_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if link.data:
+            res = (
+                await client.table("students")
+                .select("*")
+                .eq("school_id", school_id)
+                .eq("id", link.data[0]["student_id"])
+                .limit(1)
+                .execute()
+            )
+    if not res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Student profile not found")
     profile = res.data[0]
     user_res = await client.table("users").select(

@@ -38,6 +38,9 @@ class UserPublic(BaseModel):
     payment_link: Optional[str] = None
     access_blocked: bool = False
     plan_cancelled: bool = False
+    # True for accounts that must finish first-login setup (e.g. parents
+    # who signed in with the student's password) before using the app.
+    must_change_password: bool = False
 
 
 class LoginIn(BaseModel):
@@ -60,6 +63,12 @@ class RegisterIn(BaseModel):
 class ChangePasswordIn(BaseModel):
     current_password: str = Field(min_length=1)
     new_password: str = Field(min_length=6)
+
+
+class ParentSetupIn(BaseModel):
+    """First-login parent account setup: own password + recovery Gmail."""
+    password: str = Field(min_length=6)
+    email: str = Field(min_length=3)
 
 
 class TokenOut(BaseModel):
