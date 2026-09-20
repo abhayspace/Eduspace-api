@@ -119,6 +119,34 @@ async def update_my_student_profile(
     body: StudentUpdateIn,
     user: dict = Depends(require_roles("student", "parent")),
 ) -> StudentOut:
+    if user.get("role") == "parent":
+        # Parents update their own users row — contact details + personal info.
+        updates: dict = {}
+        if body.email:
+            updates["email"] = body.email.lower()
+        if body.guardian_mobile:
+            updates["mobile"] = body.guardian_mobile
+        if "alternate_mobile" in body.model_fields_set:
+            updates["alternate_mobile"] = body.alternate_mobile
+        if body.address is not None:
+            updates["address"] = body.address
+        if body.gender is not None:
+            updates["gender"] = body.gender
+        if body.dob is not None:
+            updates["dob"] = body.dob.isoformat()
+        if body.occupation is not None:
+            updates["occupation"] = body.occupation
+        if updates:
+            client = get_client()
+            try:
+                await client.table("users").update(updates).eq("id", user["id"]).execute()
+            except Exception:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "Could not update profile — the email may already be in use",
+                )
+        student = await student_service.get_student_by_user_id(user["school_id"], user["id"])
+        return student.model_copy(update={"login_password": None})
     student = await student_service.update_student_self(user["school_id"], user["id"], body)
     return student.model_copy(update={"login_password": None})
 

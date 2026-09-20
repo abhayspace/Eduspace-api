@@ -10,7 +10,7 @@ from utils.security import decode_access_token, decode_access_token_ignore_expir
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
-_USER_COLUMNS = "id,email,full_name,role,school_id,admission_no,user_code,is_active,gender"
+_USER_COLUMNS = "id,email,full_name,role,school_id,admission_no,user_code,is_active,gender,dob,mobile,address,occupation,alternate_mobile"
 
 
 async def get_user_by_token(token: str) -> dict:

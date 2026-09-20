@@ -91,6 +91,9 @@ MIGRATION_ORDER = [
     "076_school_subscription_management.sql",
     "077_subscription_dates_billing.sql",
     "078_student_numeric_passwords.sql",
+    "079_school_medium.sql",
+    "080_school_app_icon_key.sql",
+    "081_parent_profile_fields.sql",
 ]
 
 

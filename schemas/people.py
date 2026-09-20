@@ -254,6 +254,7 @@ class StudentUpdateIn(BaseModel):
     email: Optional[str] = None
     address: Optional[str] = None
     transport: Optional[str] = None
+    occupation: Optional[str] = None
     class_id: Optional[str] = None
     section_id: Optional[str] = None
     roll_no: Optional[str] = None

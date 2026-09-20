@@ -1,4 +1,5 @@
 """Auth-related request/response schemas."""
+from datetime import date
 from typing import List, Optional
 
 from pydantic import BaseModel, EmailStr, Field
@@ -41,6 +42,13 @@ class UserPublic(BaseModel):
     # True for accounts that must finish first-login setup (e.g. parents
     # who signed in with the student's password) before using the app.
     must_change_password: bool = False
+    # Parent's own profile fields (populated for role=parent).
+    dob: Optional[date] = None
+    mobile: Optional[str] = None
+    address: Optional[str] = None
+    occupation: Optional[str] = None
+    alternate_mobile: Optional[str] = None
+    parent_relation: Optional[str] = None
 
 
 class LoginIn(BaseModel):

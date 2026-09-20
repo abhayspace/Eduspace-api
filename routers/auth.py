@@ -28,7 +28,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger("eduspace.auth")
 
 _LOGIN_COLUMNS = (
-    "id,email,full_name,role,school_id,admission_no,user_code,is_active,password_hash,must_change_password,gender,login_password"
+    "id,email,full_name,role,school_id,admission_no,user_code,is_active,password_hash,must_change_password,gender,login_password,dob,mobile,address,occupation,alternate_mobile"
 )
 
 
@@ -76,6 +76,11 @@ def _to_public(user: dict) -> UserPublic:
         is_active=user.get("is_active", True),
         gender=user.get("gender"),
         must_change_password=bool(user.get("must_change_password")),
+        dob=user.get("dob"),
+        mobile=user.get("mobile"),
+        address=user.get("address"),
+        occupation=user.get("occupation"),
+        alternate_mobile=user.get("alternate_mobile"),
     )
 
 
@@ -138,6 +143,17 @@ async def _to_public_enriched(user: dict) -> UserPublic:
                     updates["subscription_popup"] = True
                     updates["subscription_amount"] = sub_amount
                     updates["payment_link"] = payment_link
+            if user.get("role") == "parent":
+                link_res = (
+                    await client.table("parents")
+                    .select("relation")
+                    .eq("school_id", school_id)
+                    .eq("user_id", user["id"])
+                    .limit(1)
+                    .execute()
+                )
+                if link_res.data:
+                    updates["parent_relation"] = link_res.data[0].get("relation")
         except Exception:
             pass
     return base.model_copy(update=updates) if updates else base
