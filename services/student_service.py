@@ -837,6 +837,7 @@ STUDENT_MEDICAL_FIELDS = (
     "emergency_relation",
     "emergency_mobile",
     "notes",
+    "identification_mark",
 )
 
 STUDENT_VISITS_TABLE = "teacher_medical_visits"

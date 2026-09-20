@@ -160,6 +160,7 @@ class StudentMedicalIn(BaseModel):
     emergency_relation: Optional[str] = None
     emergency_mobile: Optional[str] = None
     notes: Optional[str] = None
+    identification_mark: Optional[str] = None
 
 
 class StudentMedicalOut(StudentMedicalIn):

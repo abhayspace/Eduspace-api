@@ -94,6 +94,7 @@ MIGRATION_ORDER = [
     "079_school_medium.sql",
     "080_school_app_icon_key.sql",
     "081_parent_profile_fields.sql",
+    "082_student_medical_identification_mark.sql",
 ]
 
 
