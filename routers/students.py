@@ -16,6 +16,7 @@ from schemas.people import (
     StudentOut,
     StudentUpdateIn,
 )
+from routers.messages import broadcast_directory_changed
 from services import student_service
 from services.student_document_service import (
     delete_student_document,
@@ -184,7 +185,9 @@ async def approve_student(
     student_id: str,
     user: dict = Depends(require_roles("school_admin", "principal")),
 ) -> StudentOut:
-    return await student_service.approve_student_request(user["school_id"], student_id)
+    out = await student_service.approve_student_request(user["school_id"], student_id)
+    await broadcast_directory_changed(user["school_id"])
+    return out
 
 
 @router.post("/{student_id}/reject", status_code=status.HTTP_204_NO_CONTENT)
@@ -193,6 +196,7 @@ async def reject_student(
     user: dict = Depends(require_roles("school_admin", "principal")),
 ) -> Response:
     await student_service.reject_student_request(user["school_id"], student_id)
+    await broadcast_directory_changed(user["school_id"])
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -216,13 +220,17 @@ async def create_student(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only add students to your class")
         if body.section_id != assignment["class_teacher_section_id"]:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only add students to your section")
-        return await student_service.create_student(
+        out = await student_service.create_student(
             user["school_id"],
             body,
             pending_approval=True,
             requested_by_user_id=user["id"],
         )
-    return await student_service.create_student(user["school_id"], body)
+        await broadcast_directory_changed(user["school_id"])
+        return out
+    out = await student_service.create_student(user["school_id"], body)
+    await broadcast_directory_changed(user["school_id"])
+    return out
 
 
 @router.put("/{student_id}", response_model=StudentOut)
@@ -231,7 +239,9 @@ async def update_student(
     body: StudentUpdateIn,
     user: dict = Depends(require_roles("school_admin", "principal", "vice_principal", "super_admin")),
 ) -> StudentOut:
-    return await student_service.update_student(user["school_id"], student_id, body)
+    out = await student_service.update_student(user["school_id"], student_id, body)
+    await broadcast_directory_changed(user["school_id"])
+    return out
 
 
 @router.delete("/{student_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -240,6 +250,7 @@ async def delete_student(
     user: dict = Depends(require_roles("school_admin", "principal")),
 ) -> Response:
     await student_service.delete_student(user["school_id"], student_id)
+    await broadcast_directory_changed(user["school_id"])
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

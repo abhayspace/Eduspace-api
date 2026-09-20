@@ -16,6 +16,7 @@ from schemas.people import (
     TeacherOut,
     TeacherUpdateIn,
 )
+from routers.messages import broadcast_directory_changed
 from services import student_service
 from services import teacher_service
 from services.teacher_document_service import (
@@ -131,7 +132,9 @@ async def create_teacher(
     body: TeacherCreateIn,
     user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
 ) -> TeacherCreateOut:
-    return await teacher_service.create_teacher(user["school_id"], body)
+    out = await teacher_service.create_teacher(user["school_id"], body)
+    await broadcast_directory_changed(user["school_id"])
+    return out
 
 
 @router.put("/{teacher_id}", response_model=TeacherOut)
@@ -140,7 +143,9 @@ async def update_teacher(
     body: TeacherUpdateIn,
     user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
 ) -> TeacherOut:
-    return await teacher_service.update_teacher(user["school_id"], teacher_id, body)
+    out = await teacher_service.update_teacher(user["school_id"], teacher_id, body)
+    await broadcast_directory_changed(user["school_id"])
+    return out
 
 
 @router.delete("/{teacher_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -149,6 +154,7 @@ async def delete_teacher(
     user: dict = Depends(require_roles("school_admin", "principal", "vice_principal")),
 ) -> Response:
     await teacher_service.delete_teacher(user["school_id"], teacher_id)
+    await broadcast_directory_changed(user["school_id"])
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

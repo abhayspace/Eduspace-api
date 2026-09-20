@@ -257,6 +257,17 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+async def broadcast_directory_changed(school_id: Optional[str]) -> None:
+    """Tell connected clients the school directory changed (teacher/student
+    added, updated, or removed) so they refresh contacts and groups."""
+    if not school_id:
+        return
+    try:
+        await manager.broadcast(school_id, {"type": "directory_changed"})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("directory_changed broadcast failed: %s", exc)
+
+
 def _message_payload(msg: ChatMessage) -> dict:
     payload = msg.model_dump()
     payload["created_at"] = msg.created_at.isoformat()
