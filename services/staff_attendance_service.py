@@ -209,6 +209,29 @@ def _is_holiday(day: date, holiday_ranges: List[Tuple[date, date]]) -> bool:
     return any(start <= day <= end for start, end in holiday_ranges)
 
 
+def _is_non_working_day(
+    day: date,
+    holiday_ranges: List[Tuple[date, date]],
+    open_on_sunday: bool,
+) -> bool:
+    if _is_holiday(day, holiday_ranges):
+        return True
+    return _is_sunday(day) and not open_on_sunday
+
+
+async def _school_open_on_sunday(school_id: str) -> bool:
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select("open_on_sunday")
+        .eq("id", school_id)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return bool(rows and rows[0].get("open_on_sunday"))
+
+
 def _period_bounds_for_view(view: str, year: int, month: int, today: date) -> tuple[date, date]:
     if view == "yearly":
         start = date(year, 1, 1)
@@ -243,6 +266,7 @@ def _summarize_period(
     end: date,
     marks_by_date: dict[str, str],
     holiday_ranges: List[Tuple[date, date]],
+    open_on_sunday: bool,
 ) -> StaffAttendancePeriodSummary:
     working_days = 0
     present_days = 0
@@ -256,7 +280,7 @@ def _summarize_period(
         )
 
     for day in _iter_dates(start, end):
-        if _is_sunday(day) or _is_holiday(day, holiday_ranges):
+        if _is_non_working_day(day, holiday_ranges, open_on_sunday):
             continue
         working_days += 1
         status = marks_by_date.get(day.isoformat())
@@ -277,8 +301,9 @@ def _today_label(
     today: date,
     marks_by_date: dict[str, str],
     holiday_ranges: List[Tuple[date, date]],
+    open_on_sunday: bool,
 ) -> StaffAttendanceTodaySummary:
-    if _is_sunday(today) or _is_holiday(today, holiday_ranges):
+    if _is_non_working_day(today, holiday_ranges, open_on_sunday):
         return StaffAttendanceTodaySummary(label="Holiday", is_holiday=True)
 
     status = marks_by_date.get(today.isoformat())
@@ -298,6 +323,7 @@ def _period_days(
     end: date,
     marks_by_date: dict[str, str],
     holiday_ranges: List[Tuple[date, date]],
+    open_on_sunday: bool,
 ) -> List[StaffAttendanceDayOut]:
     if start > end:
         return []
@@ -309,7 +335,7 @@ def _period_days(
     }
     days: List[StaffAttendanceDayOut] = []
     for day in _iter_dates(start, end):
-        if _is_sunday(day) or _is_holiday(day, holiday_ranges):
+        if _is_non_working_day(day, holiday_ranges, open_on_sunday):
             continue
         status = marks_by_date.get(day.isoformat()) or "not_marked"
         days.append(
@@ -385,12 +411,18 @@ async def my_staff_attendance_summary(
     for holiday_year in sorted(holiday_years):
         holiday_ranges.extend(await _holiday_ranges_for_year(school_id, holiday_year))
 
+    open_on_sunday = await _school_open_on_sunday(school_id)
+
     clamped_start = max(period_start, retention_start_date)
     return StaffAttendanceSummaryOut(
-        period=_summarize_period(clamped_start, period_end, marks_by_date, holiday_ranges),
-        today=_today_label(today, marks_by_date, holiday_ranges),
+        period=_summarize_period(
+            clamped_start, period_end, marks_by_date, holiday_ranges, open_on_sunday
+        ),
+        today=_today_label(today, marks_by_date, holiday_ranges, open_on_sunday),
         period_label=_period_label(view, selected_year, selected_month),
-        days=_period_days(clamped_start, period_end, marks_by_date, holiday_ranges),
+        days=_period_days(
+            clamped_start, period_end, marks_by_date, holiday_ranges, open_on_sunday
+        ),
     )
 
 
@@ -448,10 +480,16 @@ async def my_student_attendance_summary(
     for holiday_year in sorted(holiday_years):
         holiday_ranges.extend(await _holiday_ranges_for_year(school_id, holiday_year))
 
+    open_on_sunday = await _school_open_on_sunday(school_id)
+
     clamped_start = max(period_start, retention_start_date)
     return StaffAttendanceSummaryOut(
-        period=_summarize_period(clamped_start, period_end, marks_by_date, holiday_ranges),
-        today=_today_label(today, marks_by_date, holiday_ranges),
+        period=_summarize_period(
+            clamped_start, period_end, marks_by_date, holiday_ranges, open_on_sunday
+        ),
+        today=_today_label(today, marks_by_date, holiday_ranges, open_on_sunday),
         period_label=_period_label(view, selected_year, selected_month),
-        days=_period_days(clamped_start, period_end, marks_by_date, holiday_ranges),
+        days=_period_days(
+            clamped_start, period_end, marks_by_date, holiday_ranges, open_on_sunday
+        ),
     )
