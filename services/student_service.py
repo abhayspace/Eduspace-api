@@ -388,6 +388,60 @@ async def get_student_by_user_id(school_id: str, user_id: str) -> StudentOut:
     return _build_student_out(user_res.data[0], profile, cn, sn, ct_name)
 
 
+async def get_children_for_parent(school_id: str, user_id: str) -> List[StudentOut]:
+    """All students linked to a parent account (via the parents table)."""
+    client = get_client()
+    links = (
+        await client.table("parents")
+        .select("student_id")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    student_ids = [row["student_id"] for row in (links.data or []) if row.get("student_id")]
+    if not student_ids:
+        # Self-heal: recover the single link via the shared admission_no.
+        resolved_user_id = await _resolve_student_user_id(school_id, user_id)
+        if resolved_user_id:
+            sp = (
+                await client.table("students")
+                .select("id")
+                .eq("school_id", school_id)
+                .eq("user_id", resolved_user_id)
+                .limit(1)
+                .execute()
+            )
+            student_ids = [sp.data[0]["id"]] if sp.data else []
+    children: List[StudentOut] = []
+    for sid in student_ids:
+        profile_res = (
+            await client.table("students")
+            .select("*")
+            .eq("school_id", school_id)
+            .eq("id", sid)
+            .limit(1)
+            .execute()
+        )
+        if not profile_res.data:
+            continue
+        profile = profile_res.data[0]
+        user_res = (
+            await client.table("users")
+            .select(
+                "id,email,full_name,mobile,user_code,admission_no,is_active,gender,dob,address,photo_url,login_password"
+            )
+            .eq("id", profile["user_id"])
+            .limit(1)
+            .execute()
+        )
+        if not user_res.data:
+            continue
+        cn, sn = await _resolve_class_section(school_id, profile.get("class_id"), profile.get("section_id"))
+        ct_name = await _resolve_class_teacher_name(school_id, profile.get("class_id"), profile.get("section_id"))
+        children.append(_build_student_out(user_res.data[0], profile, cn, sn, ct_name))
+    return children
+
+
 async def create_student(
     school_id: str,
     body: StudentCreateIn,

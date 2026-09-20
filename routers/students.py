@@ -93,6 +93,15 @@ async def get_my_student_profile(
     return student.model_copy(update={"login_password": None})
 
 
+@router.get("/me/children", response_model=List[StudentOut])
+async def get_my_children(
+    user: dict = Depends(require_roles("parent")),
+) -> List[StudentOut]:
+    """All students linked to this parent — powers the "My Children" section."""
+    kids = await student_service.get_children_for_parent(user["school_id"], user["id"])
+    return [k.model_copy(update={"login_password": None}) for k in kids]
+
+
 @router.get("/me/classmates")
 async def get_my_class_group_members(
     user: dict = Depends(require_roles("student", "parent")),
