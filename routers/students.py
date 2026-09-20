@@ -87,7 +87,7 @@ def _strip_password_for_teacher(student: StudentOut, user: dict) -> StudentOut:
 
 @router.get("/me", response_model=StudentOut)
 async def get_my_student_profile(
-    user: dict = Depends(require_roles("student")),
+    user: dict = Depends(require_roles("student", "parent")),
 ) -> StudentOut:
     student = await student_service.get_student_by_user_id(user["school_id"], user["id"])
     return student.model_copy(update={"login_password": None})
@@ -95,7 +95,7 @@ async def get_my_student_profile(
 
 @router.get("/me/classmates")
 async def get_my_class_group_members(
-    user: dict = Depends(require_roles("student")),
+    user: dict = Depends(require_roles("student", "parent")),
 ) -> dict:
     """Classmates + teachers assigned to the student's section (user_ids).
 
@@ -108,7 +108,7 @@ async def get_my_class_group_members(
 @router.put("/me", response_model=StudentOut)
 async def update_my_student_profile(
     body: StudentUpdateIn,
-    user: dict = Depends(require_roles("student")),
+    user: dict = Depends(require_roles("student", "parent")),
 ) -> StudentOut:
     student = await student_service.update_student_self(user["school_id"], user["id"], body)
     return student.model_copy(update={"login_password": None})
@@ -116,7 +116,7 @@ async def update_my_student_profile(
 
 @router.get("/me/medical", response_model=StudentMedicalOut)
 async def get_my_medical_record(
-    user: dict = Depends(require_roles("student")),
+    user: dict = Depends(require_roles("student", "parent")),
 ) -> StudentMedicalOut:
     return await student_service.get_my_medical(user["school_id"], user["id"])
 
@@ -124,14 +124,14 @@ async def get_my_medical_record(
 @router.put("/me/medical", response_model=StudentMedicalOut)
 async def update_my_medical_record(
     body: StudentMedicalIn,
-    user: dict = Depends(require_roles("student")),
+    user: dict = Depends(require_roles("student", "parent")),
 ) -> StudentMedicalOut:
     return await student_service.update_my_medical(user["school_id"], user["id"], body)
 
 
 @router.get("/me/medical/visits", response_model=List[StudentMedicalVisitOut])
 async def list_my_medical_visits(
-    user: dict = Depends(require_roles("student")),
+    user: dict = Depends(require_roles("student", "parent")),
 ) -> List[StudentMedicalVisitOut]:
     return await student_service.list_my_medical_visits(user["school_id"], user["id"])
 

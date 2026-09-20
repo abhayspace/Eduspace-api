@@ -269,6 +269,89 @@ async def get_student(school_id: str, student_id: str) -> StudentOut:
     return _build_student_out(user_res.data[0], profile, cn, sn)
 
 
+async def _resolve_student_user_id(school_id: str, user_id: str) -> Optional[str]:
+    """Map a user_id to the student USER id — parents resolve to their child."""
+    client = get_client()
+    direct = (
+        await client.table("students")
+        .select("user_id")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if direct.data:
+        return user_id
+
+    # Parent link → child's student row → child's user id.
+    link = (
+        await client.table("parents")
+        .select("student_id")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if link.data:
+        sp = (
+            await client.table("students")
+            .select("user_id")
+            .eq("id", link.data[0]["student_id"])
+            .limit(1)
+            .execute()
+        )
+        return sp.data[0]["user_id"] if sp.data else None
+
+    # Self-heal: the parent account shares the student's admission_no —
+    # recover the link if the parents row was never written.
+    parent_user = (
+        await client.table("users")
+        .select("role,admission_no")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not (
+        parent_user.data
+        and parent_user.data[0].get("role") == "parent"
+        and parent_user.data[0].get("admission_no")
+    ):
+        return None
+    student_user = (
+        await client.table("users")
+        .select("id")
+        .eq("school_id", school_id)
+        .eq("role", "student")
+        .eq("admission_no", parent_user.data[0]["admission_no"])
+        .limit(1)
+        .execute()
+    )
+    if not student_user.data:
+        return None
+    sp = (
+        await client.table("students")
+        .select("id,user_id")
+        .eq("school_id", school_id)
+        .eq("user_id", student_user.data[0]["id"])
+        .limit(1)
+        .execute()
+    )
+    if not sp.data:
+        return None
+    try:
+        await client.table("parents").insert(
+            {
+                "school_id": school_id,
+                "user_id": user_id,
+                "student_id": sp.data[0]["id"],
+                "relation": "guardian",
+            }
+        ).execute()
+    except Exception:
+        pass
+    return sp.data[0]["user_id"]
+
+
 async def get_student_by_user_id(school_id: str, user_id: str) -> StudentOut:
     client = get_client()
     res = (
@@ -282,67 +365,13 @@ async def get_student_by_user_id(school_id: str, user_id: str) -> StudentOut:
     if not res.data:
         # Parents resolve to their linked student's profile so the app shows
         # the child's data (profile, homework, timetable, etc.).
-        link = (
-            await client.table("parents")
-            .select("student_id")
-            .eq("school_id", school_id)
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
-        )
-        student_id = link.data[0]["student_id"] if link.data else None
-        if not student_id:
-            # Self-heal: the parent account shares the student's admission_no —
-            # recover the link if the parents row was never written.
-            parent_user = (
-                await client.table("users")
-                .select("role,admission_no")
-                .eq("id", user_id)
-                .limit(1)
-                .execute()
-            )
-            if (
-                parent_user.data
-                and parent_user.data[0].get("role") == "parent"
-                and parent_user.data[0].get("admission_no")
-            ):
-                student_user = (
-                    await client.table("users")
-                    .select("id")
-                    .eq("school_id", school_id)
-                    .eq("role", "student")
-                    .eq("admission_no", parent_user.data[0]["admission_no"])
-                    .limit(1)
-                    .execute()
-                )
-                if student_user.data:
-                    sp = (
-                        await client.table("students")
-                        .select("id")
-                        .eq("school_id", school_id)
-                        .eq("user_id", student_user.data[0]["id"])
-                        .limit(1)
-                        .execute()
-                    )
-                    if sp.data:
-                        student_id = sp.data[0]["id"]
-                        try:
-                            await client.table("parents").insert(
-                                {
-                                    "school_id": school_id,
-                                    "user_id": user_id,
-                                    "student_id": student_id,
-                                    "relation": "guardian",
-                                }
-                            ).execute()
-                        except Exception:
-                            pass
-        if student_id:
+        resolved_user_id = await _resolve_student_user_id(school_id, user_id)
+        if resolved_user_id:
             res = (
                 await client.table("students")
                 .select("*")
                 .eq("school_id", school_id)
-                .eq("id", student_id)
+                .eq("user_id", resolved_user_id)
                 .limit(1)
                 .execute()
             )
@@ -733,6 +762,17 @@ async def _own_student_profile_row(school_id: str, user_id: str) -> tuple[dict, 
         .execute()
     )
     if not res.data:
+        resolved_user_id = await _resolve_student_user_id(school_id, user_id)
+        if resolved_user_id:
+            res = (
+                await client.table("students")
+                .select("*")
+                .eq("school_id", school_id)
+                .eq("user_id", resolved_user_id)
+                .limit(1)
+                .execute()
+            )
+    if not res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Student profile not found")
     profile = res.data[0]
     user_res = (
@@ -800,11 +840,12 @@ async def list_my_medical_visits(school_id: str, user_id: str) -> List[StudentMe
     holds student visits via person_role), keyed by user_id.
     """
     client = get_client()
+    visit_user_id = await _resolve_student_user_id(school_id, user_id) or user_id
     res = (
         await client.table(STUDENT_VISITS_TABLE)
         .select("*")
         .eq("school_id", school_id)
-        .eq("user_id", user_id)
+        .eq("user_id", visit_user_id)
         .order("visit_date", desc=True)
         .limit(200)
         .execute()
@@ -858,6 +899,17 @@ async def get_my_class_group_members(school_id: str, user_id: str) -> dict:
         .limit(1)
         .execute()
     )
+    if not me_res.data:
+        resolved_user_id = await _resolve_student_user_id(school_id, user_id)
+        if resolved_user_id:
+            me_res = (
+                await client.table("students")
+                .select("class_id,section_id")
+                .eq("school_id", school_id)
+                .eq("user_id", resolved_user_id)
+                .limit(1)
+                .execute()
+            )
     if not me_res.data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Student profile not found")
     profile = me_res.data[0]
