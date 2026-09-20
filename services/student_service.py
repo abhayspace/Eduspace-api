@@ -442,6 +442,43 @@ async def get_children_for_parent(school_id: str, user_id: str) -> List[StudentO
     return children
 
 
+async def get_child_medical_for_parent(
+    school_id: str, parent_user_id: str, student_id: str
+) -> StudentMedicalOut:
+    """A child's medical record, guarded by the parent link."""
+    client = get_client()
+    link = (
+        await client.table("parents")
+        .select("id")
+        .eq("school_id", school_id)
+        .eq("user_id", parent_user_id)
+        .eq("student_id", student_id)
+        .limit(1)
+        .execute()
+    )
+    if not link.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Child not linked to this parent")
+    profile_res = (
+        await client.table("students")
+        .select("*")
+        .eq("school_id", school_id)
+        .eq("id", student_id)
+        .limit(1)
+        .execute()
+    )
+    if not profile_res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student profile not found")
+    profile = profile_res.data[0]
+    user_res = (
+        await client.table("users")
+        .select("id,full_name,gender,dob")
+        .eq("id", profile["user_id"])
+        .limit(1)
+        .execute()
+    )
+    return _build_student_medical_out(profile, user_res.data[0] if user_res.data else {})
+
+
 async def create_student(
     school_id: str,
     body: StudentCreateIn,

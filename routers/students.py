@@ -102,6 +102,17 @@ async def get_my_children(
     return [k.model_copy(update={"login_password": None}) for k in kids]
 
 
+@router.get("/me/children/{student_id}/medical", response_model=StudentMedicalOut)
+async def get_child_medical(
+    student_id: str,
+    user: dict = Depends(require_roles("parent")),
+) -> StudentMedicalOut:
+    """A linked child's medical record for the parent."""
+    return await student_service.get_child_medical_for_parent(
+        user["school_id"], user["id"], student_id
+    )
+
+
 @router.get("/me/classmates")
 async def get_my_class_group_members(
     user: dict = Depends(require_roles("student", "parent")),
