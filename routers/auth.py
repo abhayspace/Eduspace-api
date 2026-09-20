@@ -31,6 +31,10 @@ _LOGIN_COLUMNS = (
     "id,email,full_name,role,school_id,admission_no,user_code,is_active,password_hash,must_change_password,gender,login_password,dob,mobile,address,occupation,alternate_mobile"
 )
 
+# Schools where parent login is temporarily disabled while the feature is
+# still being built. KSHCNV = Kaushambi Convent Public School.
+_PARENT_LOGIN_DISABLED_SCHOOL_IDS = {"0948afc2-4378-4782-8f2e-d783b00d6466"}
+
 
 def _admission_match_clauses(ident: str) -> list[str]:
     """Build PostgREST OR clauses for admission number login (with/without leading zeros)."""
@@ -315,6 +319,12 @@ async def login(body: LoginIn) -> TokenOut:
         if not verify_password(body.password, user.get("password_hash", "")) and not await _check_login_password_fallback(client, user, body.password):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
     elif body.identifier and body.school_id and body.role == "parent":
+        # Parent accounts are still being built — disabled per school for now.
+        if body.school_id in _PARENT_LOGIN_DISABLED_SCHOOL_IDS:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Permission denied — parent login is not enabled for this school yet",
+            )
         user = await _resolve_parent_login(client, body, body.identifier.strip())
     elif body.identifier and body.school_id:
         ident = body.identifier.strip()
