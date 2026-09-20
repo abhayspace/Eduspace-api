@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 
@@ -46,6 +47,28 @@ _COLUMNS = (
     "id,school_id,sender_id,sender_name,sender_role,recipient_id,group_id,"
     "text,media_url,media_type,media_name,hidden_for,reply_to_id,created_at"
 )
+
+_last_purge_at: Dict[str, float] = {}
+_PURGE_INTERVAL_SECONDS = 15 * 60
+
+
+async def _maybe_purge_messages(school_id: str) -> None:
+    """Run retention purges at most once per interval per school.
+
+    /messages/threads and /messages are polled frequently; running the purge
+    queries on every request adds avoidable latency and DB load.
+    """
+    now = time.monotonic()
+    if now - _last_purge_at.get(school_id, 0.0) < _PURGE_INTERVAL_SECONDS:
+        return
+    _last_purge_at[school_id] = now
+    try:
+        await purge_expired_messages(school_id)
+        await purge_old_video_files(school_id)
+    except Exception as exc:  # noqa: BLE001
+        _last_purge_at[school_id] = 0.0  # retry on the next request
+        logger.warning("message purge failed: %s", exc)
+
 
 CHAT_PEER_ROLES = (
     # School Management (SCH/ADM school_admin) is not a chat profile — cannot be messaged.
@@ -425,6 +448,41 @@ async def _assert_group_access(school_id: str, group_id: str, user: dict) -> Non
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this group")
 
     raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this group")
+
+
+async def _group_membership_ctx(school_id: str, user: dict):
+    """One-shot fetch of what list_chat_threads needs to check auto-group access.
+
+    Returns ("all", None) for staff roles with full access, ("teacher", profile),
+    ("student", {(class_id, section_id), ...}), or ("none", None).
+    """
+    role = user.get("role") or ""
+    if role in {"school_admin", "principal", "vice_principal", "super_admin", "office_staff"}:
+        return "all", None
+    client = get_client()
+    if role == "teacher":
+        res = (
+            await client.table("teachers")
+            .select(
+                "classes_teaching,is_class_teacher,class_teacher_class_id,class_teacher_section_id"
+            )
+            .eq("school_id", school_id)
+            .eq("user_id", user["id"])
+            .limit(1)
+            .execute()
+        )
+        return "teacher", (res.data or [None])[0]
+    if role == "student":
+        res = (
+            await client.table("students")
+            .select("class_id,section_id")
+            .eq("school_id", school_id)
+            .eq("user_id", user["id"])
+            .execute()
+        )
+        pairs = {(r.get("class_id"), r.get("section_id")) for r in res.data or []}
+        return "student", pairs
+    return "none", None
 
 
 async def _group_member_user_ids(school_id: str, group_id: str) -> List[str]:
@@ -930,8 +988,7 @@ async def list_chat_threads(user: dict = Depends(current_user)) -> List[ChatThre
             status.HTTP_403_FORBIDDEN,
             "Chat threads are only available for users belonging to a school.",
         )
-    await purge_expired_messages(school_id)
-    await purge_old_video_files(school_id)
+    await _maybe_purge_messages(school_id)
     cutoff = retention_cutoff_iso()
 
     sent = (
@@ -1069,22 +1126,79 @@ async def list_chat_threads(user: dict = Depends(current_user)) -> List[ChatThre
         .limit(500)
         .execute()
     )
+    visible_group_rows = [
+        row
+        for row in _visible_rows_for(list(group_res.data or []), me_ids)
+        if row.get("group_id")
+        and not (
+            hide_class_auto_groups
+            and str(row.get("group_id")).startswith("group:auto:")
+        )
+    ]
+
+    # Bulk-fetch class/section names once instead of 2 queries per group.
+    auto_pairs: Dict[str, tuple[str, str]] = {}
+    for row in visible_group_rows:
+        parsed = _parse_auto_group(str(row["group_id"]))
+        if parsed:
+            auto_pairs[str(row["group_id"])] = parsed
+    class_names: Dict[str, str] = {}
+    section_names: Dict[str, str] = {}
+    if auto_pairs:
+        class_res = (
+            await client.table("classes")
+            .select("id,name")
+            .eq("school_id", school_id)
+            .in_("id", list({pair[0] for pair in auto_pairs.values()}))
+            .execute()
+        )
+        class_names = {row["id"]: row.get("name") or "" for row in class_res.data or []}
+        section_res = (
+            await client.table("sections")
+            .select("id,name")
+            .eq("school_id", school_id)
+            .in_("id", list({pair[1] for pair in auto_pairs.values()}))
+            .execute()
+        )
+        section_names = {row["id"]: row.get("name") or "" for row in section_res.data or []}
+
+    membership_kind, membership_data = await _group_membership_ctx(school_id, user)
+
+    def _has_group_access(group_id: str) -> bool:
+        if membership_kind == "all":
+            return True
+        pair = auto_pairs.get(group_id)
+        if not pair:
+            # Manual groups and group:auto:teachers are open to school members.
+            return True
+        class_id, section_id = pair
+        if class_id not in class_names or section_id not in section_names:
+            return False
+        if membership_kind == "teacher":
+            profile = membership_data
+            if not profile:
+                return False
+            return _teacher_teaches_section(
+                profile.get("classes_teaching") or [],
+                class_name=class_names[class_id],
+                section_name=section_names[section_id],
+                is_class_teacher=bool(profile.get("is_class_teacher")),
+                ct_class="",
+                ct_section="",
+                class_id=class_id,
+                section_id=section_id,
+                ct_class_id=profile.get("class_teacher_class_id"),
+                ct_section_id=profile.get("class_teacher_section_id"),
+            )
+        if membership_kind == "student":
+            return (class_id, section_id) in (membership_data or set())
+        return False
+
     group_latest: Dict[str, dict] = {}
     group_inbound: Dict[str, int] = {}
-    access_cache: Dict[str, bool] = {}
-    for row in _visible_rows_for(list(group_res.data or []), me_ids):
+    for row in visible_group_rows:
         group_id = row.get("group_id")
-        if not group_id:
-            continue
-        if hide_class_auto_groups and str(group_id).startswith("group:auto:"):
-            continue
-        if group_id not in access_cache:
-            try:
-                await _assert_group_access(school_id, group_id, user)
-                access_cache[group_id] = True
-            except HTTPException:
-                access_cache[group_id] = False
-        if not access_cache[group_id]:
+        if not _has_group_access(group_id):
             continue
         existing = group_latest.get(group_id)
         created = row.get("created_at") or ""
@@ -1100,7 +1214,15 @@ async def list_chat_threads(user: dict = Depends(current_user)) -> List[ChatThre
             created_at = created_raw
         else:
             created_at = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
-        peer_name = await _group_thread_name(school_id, group_id)
+        pair = auto_pairs.get(group_id)
+        if group_id == "group:auto:teachers":
+            peer_name = "Teachers"
+        elif pair:
+            class_name = (class_names.get(pair[0]) or "Class").strip() or "Class"
+            section_name = (section_names.get(pair[1]) or "").strip()
+            peer_name = f"{class_name} - {section_name}" if section_name else class_name
+        else:
+            peer_name = "Group"
         threads.append(
             ChatThreadOut(
                 peer_id=group_id,
@@ -1118,35 +1240,6 @@ async def list_chat_threads(user: dict = Depends(current_user)) -> List[ChatThre
     return threads
 
 
-async def _group_thread_name(school_id: str, group_id: str) -> str:
-    if group_id == "group:auto:teachers":
-        return "Teachers"
-    parsed = _parse_auto_group(group_id)
-    if not parsed:
-        return "Group"
-    class_id, section_id = parsed
-    client = get_client()
-    class_res = (
-        await client.table("classes")
-        .select("name")
-        .eq("school_id", school_id)
-        .eq("id", class_id)
-        .limit(1)
-        .execute()
-    )
-    section_res = (
-        await client.table("sections")
-        .select("name")
-        .eq("school_id", school_id)
-        .eq("id", section_id)
-        .limit(1)
-        .execute()
-    )
-    class_name = ((class_res.data or [{}])[0].get("name") or "Class").strip()
-    section_name = ((section_res.data or [{}])[0].get("name") or "").strip()
-    return f"{class_name} - {section_name}" if section_name else class_name
-
-
 @router.get("/messages", response_model=List[ChatMessage])
 async def list_messages(
     peer_id: Optional[str] = Query(default=None),
@@ -1161,8 +1254,7 @@ async def list_messages(
         )
     me = user["id"]
     me_ids = await _message_actor_ids(user)
-    await purge_expired_messages(school_id)
-    await purge_old_video_files(school_id)
+    await _maybe_purge_messages(school_id)
     cutoff = retention_cutoff_iso()
 
     if peer_id:
