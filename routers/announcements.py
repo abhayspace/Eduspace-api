@@ -18,7 +18,7 @@ from services.announcement_attachment_service import (
     resolve_announcement_attachment,
     save_announcement_attachment,
 )
-from services.notification_service import notify_school
+from services.notification_service import notify_school_roles
 from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/announcements", tags=["announcements"])
@@ -191,8 +191,11 @@ async def create_announcement(
     if not inserted.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create announcement")
     created = Announcement(**inserted.data[0])
-    await notify_school(
-        user["school_id"], f"New announcement: {created.title}", created.body
+    await notify_school_roles(
+        user["school_id"],
+        ["teacher", "student", "parent"],
+        f"New announcement: {created.title}",
+        created.body,
     )
     return created
 

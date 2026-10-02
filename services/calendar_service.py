@@ -180,11 +180,11 @@ async def _profile_birthdays(school_id: str, month: int, year: int, user: dict) 
     # ── Fetch profile rows ─────────────────────────────────────────────────
     async def fetch_students() -> list[dict]:
         if is_admin:
-            res = await client.table("students").select("user_id,dob").eq("school_id", school_id).execute()
+            res = await client.table("students").select("user_id,dob,class_id,section_id").eq("school_id", school_id).execute()
         elif visible_student_user_ids:
             res = (
                 await client.table("students")
-                .select("user_id,dob")
+                .select("user_id,dob,class_id,section_id")
                 .eq("school_id", school_id)
                 .in_("user_id", list(visible_student_user_ids))
                 .execute()
@@ -254,6 +254,42 @@ async def _profile_birthdays(school_id: str, month: int, year: int, user: dict) 
         sample_uid = list(users_by_id.keys())[0]
         print(f"[DEBUG birthdays] sample user: {users_by_id[sample_uid]}")
 
+    # Resolve class/section names so student birthdays can show "Class - Section".
+    student_detail_by_user: dict[str, str] = {}
+    if student_rows:
+        class_ids = {r["class_id"] for r in student_rows if r.get("class_id")}
+        section_ids = {r["section_id"] for r in student_rows if r.get("section_id")}
+        class_names: dict[str, str] = {}
+        section_names: dict[str, str] = {}
+        if class_ids:
+            cls_res = (
+                await client.table("classes")
+                .select("id,name")
+                .eq("school_id", school_id)
+                .in_("id", list(class_ids))
+                .execute()
+            )
+            class_names = {c["id"]: c["name"] for c in (cls_res.data or [])}
+        if section_ids:
+            sec_res = (
+                await client.table("sections")
+                .select("id,name")
+                .eq("school_id", school_id)
+                .in_("id", list(section_ids))
+                .execute()
+            )
+            section_names = {s["id"]: s["name"] for s in (sec_res.data or [])}
+        for row in student_rows:
+            uid = row.get("user_id")
+            if not uid:
+                continue
+            class_name = class_names.get(row.get("class_id") or "")
+            section_name = section_names.get(row.get("section_id") or "")
+            if class_name:
+                student_detail_by_user[uid] = (
+                    f"{class_name} - {section_name}" if section_name else class_name
+                )
+
     def _make_birthday(person_type: str, rows: list[dict]) -> None:
         for row in rows:
             user_id = row.get("user_id")
@@ -284,6 +320,7 @@ async def _profile_birthdays(school_id: str, month: int, year: int, user: dict) 
                     source="profile",
                     person_type=person_type,
                     person_user_id=user_id,
+                    person_detail=student_detail_by_user.get(user_id),
                 )
             )
 
@@ -446,11 +483,25 @@ async def delete_event(school_id: str, event_id: str) -> None:
     )
 
 
+def _settings_out(row: dict) -> CalendarSettingsOut:
+    teacher_flag = row.get("teacher_can_create_post")
+    student_flag = row.get("student_can_create_post")
+    return CalendarSettingsOut(
+        open_on_sunday=bool(row.get("open_on_sunday")),
+        allow_parent_teacher_chat=bool(row.get("allow_parent_teacher_chat") or False),
+        teacher_can_create_post=True if teacher_flag is None else bool(teacher_flag),
+        student_can_create_post=True if student_flag is None else bool(student_flag),
+    )
+
+
 async def get_settings(school_id: str) -> CalendarSettingsOut:
     client = get_client()
     res = (
         await client.table("schools")
-        .select("open_on_sunday")
+        .select(
+            "open_on_sunday,allow_parent_teacher_chat,"
+            "teacher_can_create_post,student_can_create_post"
+        )
         .eq("id", school_id)
         .limit(1)
         .execute()
@@ -458,19 +509,27 @@ async def get_settings(school_id: str) -> CalendarSettingsOut:
     rows = res.data or []
     if not rows:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
-    return CalendarSettingsOut(open_on_sunday=bool(rows[0].get("open_on_sunday")))
+    return _settings_out(rows[0])
 
 
-async def update_settings(school_id: str, open_on_sunday: bool) -> CalendarSettingsOut:
-    client = get_client()
-    res = (
-        await client.table("schools")
-        .update({"open_on_sunday": open_on_sunday})
-        .eq("id", school_id)
-        .execute()
-    )
-    rows = res.data or []
-    if not rows:
-        # Some PostgREST configs omit returning rows; re-read.
+async def update_settings(
+    school_id: str,
+    open_on_sunday: Optional[bool] = None,
+    allow_parent_teacher_chat: Optional[bool] = None,
+    teacher_can_create_post: Optional[bool] = None,
+    student_can_create_post: Optional[bool] = None,
+) -> CalendarSettingsOut:
+    updates: dict = {}
+    if open_on_sunday is not None:
+        updates["open_on_sunday"] = open_on_sunday
+    if allow_parent_teacher_chat is not None:
+        updates["allow_parent_teacher_chat"] = allow_parent_teacher_chat
+    if teacher_can_create_post is not None:
+        updates["teacher_can_create_post"] = teacher_can_create_post
+    if student_can_create_post is not None:
+        updates["student_can_create_post"] = student_can_create_post
+    if not updates:
         return await get_settings(school_id)
-    return CalendarSettingsOut(open_on_sunday=bool(rows[0].get("open_on_sunday")))
+    client = get_client()
+    await client.table("schools").update(updates).eq("id", school_id).execute()
+    return await get_settings(school_id)

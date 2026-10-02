@@ -14,10 +14,49 @@ from schemas.content import (
     ClassStudentAttendanceOut,
 )
 from services import student_service
+from services.notification_service import notify_student_and_parents
 from services.staff_attendance_service import ensure_attendance_date_allowed
 from services.teacher_service import _resolve_class_names
 
 _VALID_STATUSES = frozenset({"present", "absent", "leave"})
+
+_POSTGREST_PAGE = 1000  # Supabase/PostgREST caps responses at ~1000 rows
+
+
+async def _attendance_marks_in_range(
+    school_id: str,
+    start: str,
+    end: str,
+    emails: List[str],
+) -> List[dict]:
+    """Attendance rows for a set of students over a date range.
+
+    Paginated so a large class over many days can't silently truncate at the
+    PostgREST row cap and drop marks.
+    """
+    if not emails:
+        return []
+    client = get_client()
+    rows: List[dict] = []
+    offset = 0
+    while True:
+        res = (
+            await client.table("attendance")
+            .select("date,status,student_email")
+            .eq("school_id", school_id)
+            .gte("date", start)
+            .lte("date", end)
+            .in_("student_email", emails)
+            .order("date", desc=False)
+            .range(offset, offset + _POSTGREST_PAGE - 1)
+            .execute()
+        )
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < _POSTGREST_PAGE:
+            break
+        offset += _POSTGREST_PAGE
+    return rows
 
 
 async def _check_holiday_for_date(school_id: str, target_date: str) -> tuple[bool, Optional[str]]:
@@ -209,6 +248,17 @@ async def mark_my_class_attendance(user: dict, body: ClassStudentAttendanceMarkI
         if not inserted.data:
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to mark attendance")
 
+    status_label = body.status.replace("_", " ").title()
+    await notify_student_and_parents(
+        school_id,
+        student.id,
+        student.user_id,
+        f"Attendance: {status_label}",
+        f"{student.full_name} was marked {status_label.lower()} on {normalized_date}"
+        + (f" ({class_label})." if class_label else "."),
+        exclude_user_id=user["id"],
+    )
+
     return ClassStudentAttendanceItem(
         student_id=student.id,
         user_id=student.user_id,
@@ -234,17 +284,10 @@ async def my_class_attendance_report(user: dict, days: int = 28) -> dict:
     present_by_date: Dict[str, int] = defaultdict(int)
 
     if emails:
-        client = get_client()
-        res = (
-            await client.table("attendance")
-            .select("date, status, student_email")
-            .eq("school_id", school_id)
-            .gte("date", start.isoformat())
-            .lte("date", today.isoformat())
-            .in_("student_email", emails)
-            .execute()
+        rows = await _attendance_marks_in_range(
+            school_id, start.isoformat(), today.isoformat(), emails
         )
-        for row in res.data or []:
+        for row in rows:
             if row.get("status") == "present":
                 present_by_date[row["date"]] += 1
 
@@ -389,17 +432,10 @@ async def class_section_attendance_report(
     present_by_date: Dict[str, int] = defaultdict(int)
 
     if emails:
-        client = get_client()
-        res = (
-            await client.table("attendance")
-            .select("date, status, student_email")
-            .eq("school_id", school_id)
-            .gte("date", start.isoformat())
-            .lte("date", today.isoformat())
-            .in_("student_email", emails)
-            .execute()
+        rows = await _attendance_marks_in_range(
+            school_id, start.isoformat(), today.isoformat(), emails
         )
-        for row in res.data or []:
+        for row in rows:
             if row.get("status") == "present":
                 present_by_date[row["date"]] += 1
 

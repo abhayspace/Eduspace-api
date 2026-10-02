@@ -5,7 +5,10 @@ from pydantic import BaseModel, Field
 
 
 class HelpSendIn(BaseModel):
-    message: str = Field(min_length=1, max_length=4000)
+    message: str = Field(default="", max_length=4000)
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None
+    media_name: Optional[str] = None
 
 
 class HelpMessageOut(BaseModel):
@@ -14,6 +17,9 @@ class HelpMessageOut(BaseModel):
     sender: str  # 'user' | 'developer'
     sender_label: str = Field(alias="senderLabel")
     message: str
+    media_url: Optional[str] = Field(default=None, alias="mediaUrl")
+    media_type: Optional[str] = Field(default=None, alias="mediaType")
+    media_name: Optional[str] = Field(default=None, alias="mediaName")
     created_at: str = Field(alias="createdAt")
 
     model_config = {"populate_by_name": True}

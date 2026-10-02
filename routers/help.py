@@ -10,7 +10,8 @@ Sender label format:
 """
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 
 from database import get_client
 from schemas.help import (
@@ -19,13 +20,38 @@ from schemas.help import (
     HelpReplyIn,
     HelpSendIn,
 )
+from services.chat_media_service import (
+    filename_from_media_url,
+    resolve_chat_file,
+    save_chat_media,
+)
 from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/help", tags=["help"])
 
 DEVELOPER_ROLE = "developer"
 
-_HELP_COLUMNS = "id,user_id,sender,sender_label,message,created_at"
+_HELP_COLUMNS = "id,user_id,sender,sender_label,message,media_url,media_type,media_name,created_at"
+
+
+def _help_media_folder(user_id: str) -> str:
+    """Help media lives under chat_media/help/<user_id> — namespaced per user so
+    both the sender and the developer/team admin can resolve it."""
+    return f"help/{user_id}"
+
+
+def _help_out(row: dict) -> HelpMessageOut:
+    return HelpMessageOut(
+        id=row["id"],
+        userId=row["user_id"],
+        sender=row["sender"],
+        senderLabel=row["sender_label"],
+        message=row["message"],
+        mediaUrl=row.get("media_url"),
+        mediaType=row.get("media_type"),
+        mediaName=row.get("media_name"),
+        createdAt=row["created_at"],
+    )
 
 
 async def _build_sender_label(user: dict) -> str:
@@ -89,6 +115,9 @@ async def send_help_message(
     """Authenticated user sends a help message to the developer."""
     if user.get("role") == DEVELOPER_ROLE:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Developer cannot send help messages.")
+    text = body.message.strip()
+    if not text and not body.media_url:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Message is empty")
     label = await _build_sender_label(user)
     client = get_client()
     res = (
@@ -97,21 +126,44 @@ async def send_help_message(
             "user_id": user["id"],
             "sender": "user",
             "sender_label": label,
-            "message": body.message.strip(),
+            "message": text,
+            "media_url": body.media_url,
+            "media_type": body.media_type,
+            "media_name": body.media_name,
         })
         .execute()
     )
     if not res.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Could not send message")
-    row = res.data[0]
-    return HelpMessageOut(
-        id=row["id"],
-        userId=row["user_id"],
-        sender=row["sender"],
-        senderLabel=row["sender_label"],
-        message=row["message"],
-        createdAt=row["created_at"],
-    )
+    return _help_out(res.data[0])
+
+
+@router.post("/upload")
+async def upload_help_media(
+    file: UploadFile = File(...),
+    user: dict = Depends(current_user),
+) -> dict:
+    """Upload an image for a help message. Stored under a per-user help folder
+    so the developer/team admin can fetch it regardless of school."""
+    if user.get("role") == DEVELOPER_ROLE:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Developer cannot upload help media.")
+    saved = await save_chat_media(_help_media_folder(user["id"]), file)
+    filename = filename_from_media_url(saved["media_url"])
+    saved["media_url"] = f"/api/help/files/{user['id']}/{filename}"
+    return saved
+
+
+@router.get("/files/{owner_id}/{filename}")
+async def get_help_file(
+    owner_id: str,
+    filename: str,
+    user: dict = Depends(current_user),
+):
+    """Serve a help attachment — only the sender or the developer."""
+    if user["id"] != owner_id and user.get("role") != DEVELOPER_ROLE:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not allowed")
+    path, mime = resolve_chat_file(_help_media_folder(owner_id), filename)
+    return FileResponse(path, media_type=mime, filename=filename)
 
 
 @router.get("/messages", response_model=List[HelpMessageOut])
@@ -130,17 +182,7 @@ async def list_my_help_messages(
         .limit(500)
         .execute()
     )
-    return [
-        HelpMessageOut(
-            id=r["id"],
-            userId=r["user_id"],
-            sender=r["sender"],
-            senderLabel=r["sender_label"],
-            message=r["message"],
-            createdAt=r["created_at"],
-        )
-        for r in (res.data or [])
-    ]
+    return [_help_out(r) for r in (res.data or [])]
 
 
 @router.delete("/messages", status_code=status.HTTP_204_NO_CONTENT)
@@ -188,17 +230,10 @@ async def list_help_conversations(
                 "lastAt": r["created_at"],
                 "messages": [],
             }
-        convos[uid]["messages"].append(
-            HelpMessageOut(
-                id=r["id"],
-                userId=r["user_id"],
-                sender=r["sender"],
-                senderLabel=r["sender_label"],
-                message=r["message"],
-                createdAt=r["created_at"],
-            )
+        convos[uid]["messages"].append(_help_out(r))
+        convos[uid]["lastMessage"] = r["message"] or (
+            "Image" if r.get("media_type") == "image" else "Attachment"
         )
-        convos[uid]["lastMessage"] = r["message"]
         convos[uid]["lastAt"] = r["created_at"]
 
     # Sort by most recent activity, newest first.
@@ -239,12 +274,4 @@ async def reply_to_conversation(
     )
     if not res.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Could not send reply")
-    row = res.data[0]
-    return HelpMessageOut(
-        id=row["id"],
-        userId=row["user_id"],
-        sender=row["sender"],
-        senderLabel=row["sender_label"],
-        message=row["message"],
-        createdAt=row["created_at"],
-    )
+    return _help_out(res.data[0])

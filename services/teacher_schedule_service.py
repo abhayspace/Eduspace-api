@@ -13,9 +13,7 @@ from schemas.content import (
     TeacherScheduleSlotOut,
 )
 from services.class_section_schedule_service import (
-    _class_name,
     _period_slots_for_class,
-    _section_name,
 )
 from services.schedule_days import SCHOOL_DAYS
 
@@ -141,6 +139,34 @@ async def get_teacher_schedule(school_id: str, teacher_id: str) -> TeacherSchedu
     )
     substitutes = substitutes_res.data or []
 
+    # Batch-resolve class/section names to avoid a query per timetable row.
+    all_rows = assignments + substitutes
+    class_ids = list({row["class_id"] for row in all_rows if row.get("class_id")})
+    section_ids = list({row["section_id"] for row in all_rows if row.get("section_id")})
+    class_name_map: Dict[str, str] = {}
+    if class_ids:
+        classes_res = (
+            await client.table("classes")
+            .select("id,name")
+            .eq("school_id", school_id)
+            .in_("id", class_ids)
+            .execute()
+        )
+        class_name_map = {
+            row["id"]: row.get("name") or "Class" for row in classes_res.data or []
+        }
+    section_name_map: Dict[str, str] = {}
+    if section_ids:
+        sections_res = (
+            await client.table("sections")
+            .select("id,name")
+            .in_("id", section_ids)
+            .execute()
+        )
+        section_name_map = {
+            row["id"]: row.get("name") or "Section" for row in sections_res.data or []
+        }
+
     class_slots_cache: dict[str, List[dict]] = {}
     assignments_by_day: Dict[str, List[dict]] = {day: [] for day in SCHOOL_DAYS}
     for row in assignments:
@@ -171,8 +197,8 @@ async def get_teacher_schedule(school_id: str, teacher_id: str) -> TeacherSchedu
             if class_id not in class_slots_cache:
                 class_slots_cache[class_id] = await _period_slots_for_class(client, class_id)
             times = _slot_times(class_slots_cache[class_id], period_index)
-            class_name = await _class_name(client, school_id, class_id)
-            section_name = await _section_name(client, class_id, row["section_id"])
+            class_name = class_name_map.get(class_id, "Class")
+            section_name = section_name_map.get(row["section_id"], "Section")
 
             slot = TeacherScheduleSlotOut(
                 period_index=period_index,
@@ -198,8 +224,8 @@ async def get_teacher_schedule(school_id: str, teacher_id: str) -> TeacherSchedu
             if class_id not in class_slots_cache:
                 class_slots_cache[class_id] = await _period_slots_for_class(client, class_id)
             times = _slot_times(class_slots_cache[class_id], period_index)
-            class_name = await _class_name(client, school_id, class_id)
-            section_name = await _section_name(client, class_id, row["section_id"])
+            class_name = class_name_map.get(class_id, "Class")
+            section_name = section_name_map.get(row["section_id"], "Section")
 
             slot = TeacherScheduleSlotOut(
                 period_index=period_index,

@@ -49,6 +49,7 @@ class UserPublic(BaseModel):
     occupation: Optional[str] = None
     alternate_mobile: Optional[str] = None
     parent_relation: Optional[str] = None
+    web_access_only: bool = False
 
 
 class LoginIn(BaseModel):
@@ -58,6 +59,7 @@ class LoginIn(BaseModel):
     password: str = Field(min_length=1)
     school_id: Optional[str] = None
     role: Optional[str] = None
+    access_code: bool = False
 
 
 class RegisterIn(BaseModel):

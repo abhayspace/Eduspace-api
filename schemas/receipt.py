@@ -1,7 +1,7 @@
 """Fee receipt schemas (list / detail / search)."""
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -58,6 +58,22 @@ class EnsureReceiptIn(BaseModel):
 
 class EnsureReceiptOut(FeeReceiptOut):
     transaction_id: Optional[str] = None
+
+
+class CustomReceiptLine(BaseModel):
+    title: str = Field(..., min_length=1, max_length=120)
+    amount: float = Field(..., ge=0)
+
+
+class CustomReceiptIn(BaseModel):
+    """Ad-hoc school-branded receipt not linked to a payment record."""
+
+    student_name: str = Field(..., min_length=2, max_length=120)
+    student_id: Optional[str] = None
+    amount: float = Field(..., gt=0)
+    note: Optional[str] = Field(default=None, max_length=200)
+    lines: Optional[List[CustomReceiptLine]] = None
+    payment_method: Optional[str] = Field(default="cash", max_length=40)
 
 
 class ReceiptSnapshot(BaseModel):

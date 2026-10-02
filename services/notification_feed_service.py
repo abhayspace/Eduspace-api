@@ -9,7 +9,7 @@ Sources:
 - push notifications table
 """
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 from database import get_client
 from schemas.content import NotificationFeedItem
@@ -192,7 +192,7 @@ async def _appointments_feed(school_id: str, user: dict) -> List[NotificationFee
         .select("id,title,appointment_date,appointment_time,description,status,created_at")
         .eq("school_id", school_id)
         .gte("appointment_date", today)
-        .order("appointment_date", asc=True)
+        .order("appointment_date")
         .limit(10)
     )
     # Non-admins only see their own
@@ -213,7 +213,7 @@ async def _appointments_feed(school_id: str, user: dict) -> List[NotificationFee
         items.append(NotificationFeedItem(
             id=f"apt_{row['id']}",
             type="appointment",
-            title=f"PTM: {row.get('title') or ''}",
+            title=f"Appointment: {row.get('title') or ''}",
             body=row.get("description") or "",
             icon="calendar",
             route="/(app)/appointments",
@@ -234,7 +234,7 @@ async def _fees_feed(school_id: str, user: dict) -> List[NotificationFeedItem]:
         .eq("school_id", school_id)
         .eq("student_email", user.get("email") or "")
         .eq("status", "pending")
-        .order("due_date", asc=True)
+        .order("due_date")
         .limit(10)
         .execute()
     )
@@ -290,21 +290,77 @@ async def _push_notifications_feed(school_id: str, user: dict) -> List[Notificat
     return items
 
 
+_ADMIN_ROLES = ("school_admin", "principal", "vice_principal", "super_admin", "office_staff")
+
+
+async def _get_last_seen(school_id: str, user_id: str) -> Optional[datetime]:
+    try:
+        res = (
+            await get_client()
+            .table("notification_read_state")
+            .select("last_seen_at")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        row = (res.data or [None])[0]
+        if row and row.get("last_seen_at"):
+            return datetime.fromisoformat(str(row["last_seen_at"]).replace("Z", "+00:00"))
+    except Exception:
+        pass
+    return None
+
+
+async def mark_feed_seen(school_id: str, user_id: str) -> None:
+    """Record that the user has seen the feed up to now."""
+    try:
+        await get_client().table("notification_read_state").upsert(
+            {
+                "user_id": user_id,
+                "school_id": school_id,
+                "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="user_id",
+        ).execute()
+    except Exception:
+        pass
+
+
 async def get_notification_feed(school_id: str, user: dict) -> List[NotificationFeedItem]:
     """Aggregate all notification sources into a single feed, sorted by date."""
-    # Fetch all sources in parallel
-    results = await _gather(
-        _announcement_feed(school_id, user),
-        _forms_feed(school_id, user),
-        _quizzes_feed(school_id, user),
-        _appointments_feed(school_id, user),
-        _fees_feed(school_id, user),
-        _push_notifications_feed(school_id, user),
-        _force_update_feed(),
-    )
+    # Admins only get operational items (meeting requests), notifications
+    # actually sent to them (messages etc.), and app-update alerts — school
+    # content like announcements/holidays/homework is skipped since they
+    # authored it themselves.
+    if (user.get("role") or "") in _ADMIN_ROLES:
+        results = await _gather(
+            _appointments_feed(school_id, user),
+            _push_notifications_feed(school_id, user),
+            _force_update_feed(),
+        )
+    else:
+        results = await _gather(
+            _announcement_feed(school_id, user),
+            _forms_feed(school_id, user),
+            _quizzes_feed(school_id, user),
+            _appointments_feed(school_id, user),
+            _fees_feed(school_id, user),
+            _push_notifications_feed(school_id, user),
+            _force_update_feed(),
+        )
     all_items: List[NotificationFeedItem] = []
     for batch in results:
         all_items.extend(batch)
+
+    # Synthesized items (announcements, forms, quizzes, fees, force-update)
+    # don't live in the notifications table — mark them read once they predate
+    # the user's last "seen" timestamp (set by PUT /notifications/mark-all-read).
+    last_seen = await _get_last_seen(school_id, user["id"])
+    if last_seen is not None:
+        for item in all_items:
+            if not item.id.startswith("notif_") and item.created_at and item.created_at <= last_seen:
+                item.is_read = True
+
     # Sort by created_at descending
     all_items.sort(key=lambda x: x.created_at, reverse=True)
     return all_items[:100]  # cap at 100

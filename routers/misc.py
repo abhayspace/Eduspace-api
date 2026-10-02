@@ -20,8 +20,6 @@ STAFF_ROLES = [
     "hostel_manager",
     "transport_manager",
     "school_doctor",
-    "principal",
-    "vice_principal",
 ]
 
 
@@ -36,6 +34,20 @@ async def _count(table: str, school_id: str, **filters) -> int:
         client.table(table)
         .select("*", count="exact", head=True)
         .eq("school_id", school_id)
+    )
+    for key, value in filters.items():
+        query = query.eq(key, value)
+    res = await query.execute()
+    return res.count if res.count is not None else 0
+
+
+async def _count_created_since(table: str, school_id: str, start: str, **filters) -> int:
+    client = get_client()
+    query = (
+        client.table(table)
+        .select("*", count="exact", head=True)
+        .eq("school_id", school_id)
+        .gte("created_at", start)
     )
     for key, value in filters.items():
         query = query.eq(key, value)
@@ -161,6 +173,19 @@ async def _count_staff(school_id: str) -> int:
         .select("*", count="exact", head=True)
         .eq("school_id", school_id)
         .in_("role", STAFF_ROLES)
+        .execute()
+    )
+    return res.count if res.count is not None else 0
+
+
+async def _count_staff_created_since(school_id: str, start: str) -> int:
+    client = get_client()
+    res = (
+        await client.table("users")
+        .select("*", count="exact", head=True)
+        .eq("school_id", school_id)
+        .in_("role", STAFF_ROLES)
+        .gte("created_at", start)
         .execute()
     )
     return res.count if res.count is not None else 0
@@ -352,15 +377,29 @@ async def stats_counts(user: dict = Depends(current_user)) -> dict:
     if cached is not None:
         return cached
 
-    students, teachers, total_staff = await asyncio.gather(
+    month_start = date.today().replace(day=1).isoformat()
+    (
+        students,
+        teachers,
+        total_staff,
+        students_added_this_month,
+        teachers_added_this_month,
+        staff_added_this_month,
+    ) = await asyncio.gather(
         _count_students(s),
         _count("users", s, role="teacher"),
         _count_staff(s),
+        _count_created_since("students", s, month_start),
+        _count_created_since("users", s, month_start, role="teacher"),
+        _count_staff_created_since(s, month_start),
     )
     result = {
         "students": students,
         "teachers": teachers,
         "total_staff": total_staff,
+        "students_added_this_month": students_added_this_month,
+        "teachers_added_this_month": teachers_added_this_month,
+        "staff_added_this_month": staff_added_this_month,
     }
     set_cached_value(cache_key, result)
     return result

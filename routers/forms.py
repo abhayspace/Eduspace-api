@@ -20,14 +20,14 @@ staff_only = require_roles("teacher", "school_admin", "principal", "vice_princip
 
 @router.get("", response_model=List[FormListItemOut])
 async def list_forms(user: dict = Depends(current_user)) -> List[FormListItemOut]:
-    if user["role"] == "student":
+    if user["role"] in ("student", "parent"):
         return await form_service.list_forms_student(user["school_id"], user["id"])
     return await form_service.list_forms_teacher(user["school_id"], user["id"])
 
 
 @router.get("/{form_id}", response_model=FormDetailOut)
 async def get_form(form_id: str, user: dict = Depends(current_user)) -> FormDetailOut:
-    if user["role"] == "student":
+    if user["role"] in ("student", "parent"):
         return await form_service.get_form_student(user["school_id"], form_id)
     return await form_service.get_form(user["school_id"], form_id)
 
@@ -55,8 +55,10 @@ async def submit_response(
     body: FormResponseSubmitIn,
     user: dict = Depends(current_user),
 ) -> FormResponseOut:
-    if user["role"] != "student":
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only students can submit form responses")
+    if user["role"] not in ("student", "parent"):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only students and parents can submit form responses"
+        )
     return await form_service.submit_response(
         user["school_id"],
         user["id"],

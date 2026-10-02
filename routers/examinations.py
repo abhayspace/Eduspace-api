@@ -23,6 +23,55 @@ _COLUMNS = "id,school_id,name,term,class_name,subject,exam_date,max_marks"
 _SETUP_ROLES = ("school_admin", "principal", "vice_principal", "super_admin")
 
 
+async def _subjects_for_class(client, school_id: str, class_name: str) -> List[str]:
+    """Subjects a class studies: from its timetable period assignments; if the
+    class has none configured, fall back to every subject in the school."""
+    cls_res = (
+        await client.table("classes")
+        .select("id")
+        .eq("school_id", school_id)
+        .eq("name", class_name.strip())
+        .limit(1)
+        .execute()
+    )
+    class_id = (cls_res.data or [{}])[0].get("id")
+    if class_id:
+        assign = (
+            await client.table("class_section_period_assignments")
+            .select("subject_name")
+            .eq("school_id", school_id)
+            .eq("class_id", class_id)
+            .execute()
+        )
+        names = sorted(
+            {
+                str(row["subject_name"]).strip()
+                for row in (assign.data or [])
+                if row.get("subject_name")
+            }
+        )
+        if names:
+            return names
+    subs = (
+        await client.table("subjects")
+        .select("name")
+        .eq("school_id", school_id)
+        .execute()
+    )
+    return sorted({str(row["name"]).strip() for row in (subs.data or []) if row.get("name")})
+
+
+async def _subjects_for_classes(client, school_id: str, class_names: List[str], body_subjects: List[str]) -> dict:
+    """Map class_name -> subject list. Explicit body_subjects win per class."""
+    out: dict[str, List[str]] = {}
+    for cn in class_names:
+        key = cn.strip()
+        out[key] = [s.strip() for s in body_subjects if s.strip()] or await _subjects_for_class(
+            client, school_id, key
+        )
+    return out
+
+
 @router.get("", response_model=List[Examination])
 async def list_examinations(
     name: Optional[str] = Query(default=None),
@@ -122,16 +171,18 @@ async def create_examination_batch(
     client = get_client()
     school_id = user["school_id"]
     name = body.name.strip()
+    subjects_map = await _subjects_for_classes(client, school_id, body.class_names, body.subjects)
     rows = []
     for class_name in body.class_names:
-        for subject in body.subjects:
+        cn = class_name.strip()
+        for subject in subjects_map.get(cn, []):
             rows.append(
                 {
                     "school_id": school_id,
                     "name": name,
                     "term": body.term,
-                    "class_name": class_name.strip(),
-                    "subject": subject.strip(),
+                    "class_name": cn,
+                    "subject": subject,
                     "exam_date": None,
                     "max_marks": body.max_marks,
                 }
@@ -178,11 +229,11 @@ async def replace_examination_group(
         .execute()
     )
 
+    subjects_map = await _subjects_for_classes(client, school_id, body.class_names, body.subjects)
     rows = []
     for class_name in body.class_names:
-        for subject in body.subjects:
-            cn = class_name.strip()
-            sub = subject.strip()
+        cn = class_name.strip()
+        for sub in subjects_map.get(cn, []):
             rows.append(
                 {
                     "school_id": school_id,

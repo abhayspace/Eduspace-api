@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     groq_model: str = Field(default="openai/gpt-oss-120b", alias="GROQ_MODEL")
 
+    # --- Team portal (TEAM01 institution code) ---
+    team_access_code: str = Field(default="19102006", alias="TEAM_ACCESS_CODE")
+
     # --- App ---
     cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

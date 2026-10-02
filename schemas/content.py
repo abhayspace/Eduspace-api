@@ -239,21 +239,29 @@ class FeeTransactionOut(BaseModel):
     roll_no: Optional[str] = None
 
 
+class FeeAmountItem(BaseModel):
+    title: str = Field(..., min_length=1, max_length=80)
+    amount: float = Field(..., ge=0)
+
+
 class FeeStructureSectionOut(BaseModel):
     id: str
     name: str
     monthly_amount: Optional[float] = None
+    breakdown: Optional[List[FeeAmountItem]] = None
 
 
 class FeeStructureClassOut(BaseModel):
     id: str
     name: str
     monthly_amount: Optional[float] = None
+    breakdown: Optional[List[FeeAmountItem]] = None
     sections: List[FeeStructureSectionOut] = []
 
 
 class FeeAmountIn(BaseModel):
     amount: float = Field(..., ge=0)
+    items: Optional[List[FeeAmountItem]] = None
 
 
 class StudentFeeDueIn(BaseModel):
@@ -265,6 +273,19 @@ class StudentFeeDueIn(BaseModel):
 class StudentFeeMarkPaidIn(BaseModel):
     mode: Literal["this_month", "full", "custom"] = "full"
     amount: Optional[float] = Field(default=None, gt=0)
+
+
+class FeeReminderIn(BaseModel):
+    title: Optional[str] = None
+    message: str = Field(..., min_length=3, max_length=500)
+    scope: Literal["all", "unpaid"] = "unpaid"
+
+
+class FeeChargeIn(BaseModel):
+    class_ids: List[str] = Field(default_factory=list)  # empty = all classes
+    title: str = Field(..., min_length=2, max_length=80)
+    amount: float = Field(..., gt=0)
+    apply_months: List[int] = Field(default_factory=list)
 
 
 class Examination(BaseModel):
@@ -282,7 +303,9 @@ class ExaminationBatchIn(BaseModel):
     name: str = Field(min_length=1)
     term: Optional[str] = None
     class_names: List[str] = Field(min_length=1)
-    subjects: List[str] = Field(min_length=1)
+    # Optional — when empty, subjects are auto-derived from each class's
+    # timetable (class_section_period_assignments), else all school subjects.
+    subjects: List[str] = []
     max_marks: float = 100
 
 

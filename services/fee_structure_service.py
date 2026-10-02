@@ -114,6 +114,13 @@ async def ensure_current_month_fees(school_id: str) -> int:
         touched += await _apply_monthly_fees_for_sections(
             school_id, class_id, class_name, section_amounts
         )
+
+    # Custom class charges scheduled for this month (annual fee, caution…).
+    today = date.today()
+    try:
+        touched += await apply_month_charges(school_id, today.year, today.month)
+    except Exception:
+        pass
     return touched
 
 
@@ -173,43 +180,56 @@ async def list_fee_structure(school_id: str) -> List[FeeStructureClassOut]:
             .order("name")
             .execute(),
             client.table("class_section_fees")
-            .select("section_id,class_id,monthly_amount")
+            .select("section_id,class_id,monthly_amount,breakdown")
             .eq("school_id", school_id)
             .execute(),
         )
     except APIError as exc:
         _raise_if_missing_fees_table(exc)
 
-    amount_by_section = {
-        row["section_id"]: float(row["monthly_amount"])
-        for row in (fees_res.data or [])
-        if row.get("section_id") is not None
-    }
+    amount_by_section: dict[str, float] = {}
+    breakdown_by_section: dict[str, list] = {}
+    for row in fees_res.data or []:
+        sid = row.get("section_id")
+        if sid is None:
+            continue
+        amount_by_section[sid] = float(row["monthly_amount"])
+        if row.get("breakdown"):
+            breakdown_by_section[sid] = row["breakdown"]
 
     result: List[FeeStructureClassOut] = []
     for row in classes_res.data or []:
         sections_raw = row.get("sections") or []
         sections: List[FeeStructureSectionOut] = []
         amounts: List[float] = []
+        breakdowns: List[list] = []
         for sec in sections_raw:
             amt = amount_by_section.get(sec["id"])
+            bd = breakdown_by_section.get(sec["id"])
             if amt is not None:
                 amounts.append(amt)
+            if bd:
+                breakdowns.append(bd)
             sections.append(
                 FeeStructureSectionOut(
                     id=sec["id"],
                     name=sec["name"],
                     monthly_amount=amt,
+                    breakdown=bd,
                 )
             )
         class_amount: Optional[float] = None
+        class_breakdown: Optional[list] = None
         if amounts and len(set(amounts)) == 1:
             class_amount = amounts[0]
+            if len(breakdowns) == len(amounts) and len({str(b) for b in breakdowns}) == 1:
+                class_breakdown = breakdowns[0]
         result.append(
             FeeStructureClassOut(
                 id=row["id"],
                 name=row["name"],
                 monthly_amount=class_amount,
+                breakdown=class_breakdown,
                 sections=sections,
             )
         )
@@ -221,6 +241,7 @@ async def _upsert_section_amount(
     class_id: str,
     section_id: str,
     amount: float,
+    breakdown: Optional[list] = None,
 ) -> None:
     client = get_client()
     now = _now().isoformat()
@@ -237,13 +258,21 @@ async def _upsert_section_amount(
         "class_id": class_id,
         "section_id": section_id,
         "monthly_amount": amount,
+        "breakdown": breakdown,
         "updated_at": now,
     }
     try:
         if existing.data:
             await (
                 client.table("class_section_fees")
-                .update({"monthly_amount": amount, "updated_at": now, "class_id": class_id})
+                .update(
+                    {
+                        "monthly_amount": amount,
+                        "breakdown": breakdown,
+                        "updated_at": now,
+                        "class_id": class_id,
+                    }
+                )
                 .eq("id", existing.data[0]["id"])
                 .execute()
             )
@@ -427,15 +456,15 @@ async def school_fee_dashboard_stats(school_id: str) -> dict:
     today = date.today()
     month_prefix = f"{today.year:04d}-{today.month:02d}"
     month_label = today.strftime("%b %Y").lower()
-    month_start = f"{month_prefix}-01T00:00:00+00:00"
-    last_day = monthrange(today.year, today.month)[1]
-    month_end = f"{month_prefix}-{last_day:02d}T23:59:59.999999+00:00"
 
     page_size = 1000
 
-    async def _fetch_pending_fees() -> tuple[float, set[str]]:
+    async def _fetch_pending_fees() -> tuple[float, float, int, set[str]]:
         """Fetch only pending fees — reduces payload vs fetching all fees."""
         total = 0.0
+        overdue = 0.0
+        pending_count = 0
+        today_iso = today.isoformat()
         emails: set[str] = set()
         offset = 0
         while True:
@@ -456,7 +485,10 @@ async def school_fee_dashboard_stats(school_id: str) -> dict:
                 if amt <= 0:
                     continue
                 total += amt
+                pending_count += 1
                 due = str(row.get("due_date") or "")
+                if due and due < today_iso:
+                    overdue += amt
                 title = str(row.get("title") or "").lower()
                 if due.startswith(month_prefix) or month_label in title:
                     email = (row.get("student_email") or "").strip().lower()
@@ -465,39 +497,45 @@ async def school_fee_dashboard_stats(school_id: str) -> dict:
             if len(rows) < page_size:
                 break
             offset += page_size
-        return total, emails
+        return total, overdue, pending_count, emails
 
-    async def _fetch_payments() -> float:
-        """Fetch payments for the current month."""
-        total = 0.0
+    async def _fetch_year_payments() -> list[float]:
+        """Payments collected per month for the current calendar year."""
+        monthly = [0.0] * 12
+        year_start = f"{today.year:04d}-01-01T00:00:00+00:00"
+        year_end = f"{today.year:04d}-12-31T23:59:59.999999+00:00"
         offset = 0
         while True:
             pay_res = (
                 await client.table("payments")
                 .select("amount,paid_at")
                 .eq("school_id", school_id)
-                .gte("paid_at", month_start)
-                .lte("paid_at", month_end)
+                .gte("paid_at", year_start)
+                .lte("paid_at", year_end)
                 .range(offset, offset + page_size - 1)
                 .execute()
             )
             pay_rows = pay_res.data or []
             for row in pay_rows:
                 try:
-                    total += float(row.get("amount") or 0)
+                    amt = float(row.get("amount") or 0)
                 except (TypeError, ValueError):
                     continue
+                ref = str(row.get("paid_at") or "")
+                try:
+                    mi = int(ref[5:7]) - 1
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= mi <= 11:
+                    monthly[mi] += amt
             if len(pay_rows) < page_size:
                 break
             offset += page_size
-        return total
+        return monthly
 
-    pending_total, unpaid_emails = await _fetch_pending_fees()
-    paid_this_month = await _fetch_payments()
-
-    # Fallback if payments table empty but fees were marked paid without ledger rows
-    if paid_this_month <= 0:
-        fee_paid = 0.0
+    async def _fetch_year_fees_paid() -> list[float]:
+        """Fallback: paid fee rows bucketed per month (when payments ledger is empty)."""
+        monthly = [0.0] * 12
         offset = 0
         while True:
             res = (
@@ -513,35 +551,59 @@ async def school_fee_dashboard_stats(school_id: str) -> dict:
                 paid_at = str(row.get("paid_at") or "")
                 due = str(row.get("due_date") or "")
                 ref = paid_at or due
-                in_month = False
-                if ref:
-                    if ref.startswith(month_prefix):
-                        in_month = True
-                    else:
-                        try:
-                            dt = datetime.fromisoformat(ref.replace("Z", "+00:00"))
-                            in_month = dt.year == today.year and dt.month == today.month
-                        except Exception:
-                            in_month = len(ref) >= 7 and ref[:7] == month_prefix
-                if in_month:
+                if not ref:
+                    continue
+                in_year = False
+                if ref.startswith(f"{today.year:04d}-"):
+                    in_year = True
+                else:
                     try:
-                        fee_paid += float(row.get("amount") or 0)
-                    except (TypeError, ValueError):
-                        pass
+                        dt = datetime.fromisoformat(ref.replace("Z", "+00:00"))
+                        in_year = dt.year == today.year
+                    except Exception:
+                        in_year = len(ref) >= 4 and ref[:4] == f"{today.year:04d}"
+                if not in_year:
+                    continue
+                try:
+                    mi = int(ref[5:7]) - 1
+                except (TypeError, ValueError):
+                    continue
+                if not (0 <= mi <= 11):
+                    continue
+                try:
+                    monthly[mi] += float(row.get("amount") or 0)
+                except (TypeError, ValueError):
+                    pass
             if len(rows) < page_size:
                 break
             offset += page_size
-        paid_this_month = fee_paid
+        return monthly
+
+    pending_total, overdue_total, pending_count, unpaid_emails = await _fetch_pending_fees()
+    monthly_collected = await _fetch_year_payments()
+    paid_this_month = monthly_collected[today.month - 1]
+
+    # Fallback if payments ledger is empty but fees were marked paid without rows
+    if sum(monthly_collected) <= 0:
+        fallback_monthly = await _fetch_year_fees_paid()
+        if sum(fallback_monthly) > 0:
+            monthly_collected = fallback_monthly
+            paid_this_month = monthly_collected[today.month - 1]
 
     return {
         "total_due": round(pending_total, 2),
+        "overdue_due": round(overdue_total, 2),
+        "pending_count": pending_count,
         "paid_this_month": round(paid_this_month, 2),
+        "monthly_collected": [round(m, 2) for m in monthly_collected],
         "unpaid_students_this_month": len(unpaid_emails),
         "retention_months": FEE_RETENTION_MONTHS,
     }
 
 
-async def set_class_monthly_amount(school_id: str, class_id: str, amount: float) -> FeeStructureClassOut:
+async def set_class_monthly_amount(
+    school_id: str, class_id: str, amount: float, breakdown: Optional[list] = None
+) -> FeeStructureClassOut:
     client = get_client()
     cls = (
         await client.table("classes")
@@ -560,7 +622,7 @@ async def set_class_monthly_amount(school_id: str, class_id: str, amount: float)
 
     section_amounts: dict[str, float] = {}
     for sec in sections:
-        await _upsert_section_amount(school_id, class_id, sec["id"], amount)
+        await _upsert_section_amount(school_id, class_id, sec["id"], amount, breakdown)
         section_amounts[sec["id"]] = amount
 
     await _apply_monthly_fees_for_sections(
@@ -579,7 +641,7 @@ async def set_class_monthly_amount(school_id: str, class_id: str, amount: float)
 
 
 async def set_section_monthly_amount(
-    school_id: str, section_id: str, amount: float
+    school_id: str, section_id: str, amount: float, breakdown: Optional[list] = None
 ) -> FeeStructureSectionOut:
     client = get_client()
     sec = (
@@ -607,7 +669,7 @@ async def set_section_monthly_amount(
         )
         class_name = (cls.data or [{}])[0].get("name") or "Class"
 
-    await _upsert_section_amount(school_id, class_id, section_id, amount)
+    await _upsert_section_amount(school_id, class_id, section_id, amount, breakdown)
     await _apply_monthly_fees_for_sections(
         school_id,
         class_id,
@@ -615,4 +677,221 @@ async def set_section_monthly_amount(
         {section_id: amount},
         overwrite_pending_amount=True,
     )
-    return FeeStructureSectionOut(id=section_id, name=row["name"], monthly_amount=amount)
+    return FeeStructureSectionOut(
+        id=section_id, name=row["name"], monthly_amount=amount, breakdown=breakdown
+    )
+
+
+# ---------------------------------------------------------------------------
+# Custom class charges (annual fee, caution money, …) applied in a given month
+# ---------------------------------------------------------------------------
+
+
+async def list_class_charges(
+    school_id: str, class_id: Optional[str] = None
+) -> List[dict]:
+    client = get_client()
+    q = (
+        client.table("class_fee_charges")
+        .select("id,class_id,title,amount,apply_month,created_at")
+        .eq("school_id", school_id)
+    )
+    if class_id:
+        q = q.eq("class_id", class_id)
+    res = await q.order("apply_month").execute()
+    rows = res.data or []
+    class_ids = {r["class_id"] for r in rows if r.get("class_id")}
+    names: dict[str, str] = {}
+    if class_ids:
+        cls_res = (
+            await client.table("classes")
+            .select("id,name")
+            .eq("school_id", school_id)
+            .in_("id", list(class_ids))
+            .execute()
+        )
+        for c in cls_res.data or []:
+            names[c["id"]] = c.get("name") or ""
+    return [
+        {**r, "class_name": names.get(r.get("class_id") or "", "")}
+        for r in rows
+    ]
+
+
+async def _apply_class_charge(
+    school_id: str, charge: dict, *, year: Optional[int] = None
+) -> int:
+    """Create pending fee rows for every student of the charge's class.
+
+    Title carries the month+year so the same charge can recur every year and
+    existing rows (paid or pending) are never duplicated.
+    """
+    client = get_client()
+    class_id = charge.get("class_id")
+    month = int(charge.get("apply_month") or 0)
+    amount = float(charge.get("amount") or 0)
+    if not class_id or not (1 <= month <= 12) or amount <= 0:
+        return 0
+    year = year or date.today().year
+
+    cls_res = (
+        await client.table("classes")
+        .select("sections(id)")
+        .eq("school_id", school_id)
+        .eq("id", class_id)
+        .limit(1)
+        .execute()
+    )
+    sections = (cls_res.data or [{}])[0].get("sections") or []
+    emails_by_section = await _student_emails_for_sections(
+        school_id, [s["id"] for s in sections if s.get("id")]
+    )
+    all_emails = sorted({e for v in emails_by_section.values() for e in v})
+    if not all_emails:
+        return 0
+
+    title = f"{charge.get('title')} · {_month_label(year, month)}"
+    due = _due_date(year, month)
+
+    existing_res = (
+        await client.table("fees")
+        .select("student_email")
+        .eq("school_id", school_id)
+        .eq("title", title)
+        .in_("student_email", all_emails)
+        .execute()
+    )
+    existing = {r["student_email"] for r in (existing_res.data or [])}
+
+    to_insert = [
+        {
+            "school_id": school_id,
+            "student_email": email,
+            "title": title,
+            "amount": amount,
+            "due_date": due,
+            "status": "pending",
+        }
+        for email in all_emails
+        if email not in existing
+    ]
+    if to_insert:
+        try:
+            await client.table("fees").insert(to_insert).execute()
+        except Exception:
+            return 0
+    return len(to_insert)
+
+
+async def apply_month_charges(school_id: str, year: int, month: int) -> int:
+    """Apply every class charge scheduled for `month` of `year`."""
+    client = get_client()
+    try:
+        res = (
+            await client.table("class_fee_charges")
+            .select("id,class_id,title,amount,apply_month")
+            .eq("school_id", school_id)
+            .eq("apply_month", month)
+            .execute()
+        )
+    except APIError:
+        return 0  # table may not exist yet (migration pending)
+    touched = 0
+    for charge in res.data or []:
+        try:
+            touched += await _apply_class_charge(school_id, charge, year=year)
+        except Exception:
+            continue
+    return touched
+
+
+async def add_class_charges(
+    school_id: str,
+    class_ids: List[str],
+    title: str,
+    amount: float,
+    apply_months: List[int],
+) -> List[dict]:
+    """Create charge rows for every (class, month) combination.
+
+    Empty ``class_ids`` means "all classes" of the school.
+    """
+    title = title.strip()
+    if not title:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Charge title is required")
+    if amount <= 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Enter a valid amount")
+    months = sorted({int(m) for m in apply_months if 1 <= int(m) <= 12})
+    if not months:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Pick at least one month")
+
+    client = get_client()
+    cls_res = (
+        await client.table("classes")
+        .select("id,name")
+        .eq("school_id", school_id)
+        .execute()
+    )
+    all_classes = cls_res.data or []
+    if class_ids:
+        wanted = set(class_ids)
+        targets = [c for c in all_classes if c["id"] in wanted]
+    else:
+        targets = all_classes
+    if not targets:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No matching classes found")
+
+    # Skip combos that already exist so retries never double-create charges.
+    existing_res = (
+        await client.table("class_fee_charges")
+        .select("class_id,apply_month")
+        .eq("school_id", school_id)
+        .eq("title", title)
+        .eq("amount", amount)
+        .in_("class_id", [c["id"] for c in targets])
+        .execute()
+    )
+    existing = {
+        (r["class_id"], int(r["apply_month"])) for r in (existing_res.data or [])
+    }
+
+    rows_payload = [
+        {
+            "school_id": school_id,
+            "class_id": c["id"],
+            "title": title,
+            "amount": amount,
+            "apply_month": month,
+        }
+        for c in targets
+        for month in months
+        if (c["id"], month) not in existing
+    ]
+    if not rows_payload:
+        return []
+    res = await client.table("class_fee_charges").insert(rows_payload).execute()
+    rows = res.data or []
+    name_by_id = {c["id"]: c.get("name") or "" for c in targets}
+    for r in rows:
+        r["class_name"] = name_by_id.get(r.get("class_id") or "", "")
+
+    # Bill students immediately for combos scheduled in the current month.
+    today = date.today()
+    for row in rows:
+        if int(row.get("apply_month") or 0) == today.month:
+            try:
+                await _apply_class_charge(school_id, row, year=today.year)
+            except Exception:
+                pass
+    return rows
+
+
+async def delete_class_charge(school_id: str, charge_id: str) -> None:
+    client = get_client()
+    await (
+        client.table("class_fee_charges")
+        .delete()
+        .eq("school_id", school_id)
+        .eq("id", charge_id)
+        .execute()
+    )

@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import calendar
 from datetime import date, timedelta
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from fastapi import HTTPException, status
 
 from database import get_client
+from services.notification_service import notify_users
 from schemas.content import (
     StaffAttendanceDayOut,
     StaffAttendanceMarkIn,
@@ -65,6 +66,7 @@ async def list_staff_attendance_for_range(
     school_id: str,
     from_date: str,
     to_date: str,
+    user_id: Optional[str] = None,
 ) -> List[StaffAttendanceOut]:
     start = ensure_attendance_date_allowed(from_date)
     end = ensure_attendance_date_allowed(to_date)
@@ -80,16 +82,29 @@ async def list_staff_attendance_for_range(
         )
 
     client = get_client()
-    res = (
-        await client.table("staff_attendance")
-        .select(_STAFF_COLUMNS)
-        .eq("school_id", school_id)
-        .gte("date", start)
-        .lte("date", end)
-        .order("date", desc=False)
-        .execute()
-    )
-    return [StaffAttendanceOut(**row) for row in (res.data or [])]
+    # PostgREST caps responses (Supabase default max-rows = 1000), so paginate
+    # instead of relying on a single request — a whole-school range can easily
+    # exceed the cap and silently drop the newest rows.
+    page_size = 1000
+    rows: List[dict] = []
+    offset = 0
+    while True:
+        query = (
+            client.table("staff_attendance")
+            .select(_STAFF_COLUMNS)
+            .eq("school_id", school_id)
+            .gte("date", start)
+            .lte("date", end)
+        )
+        if user_id:
+            query = query.eq("user_id", user_id)
+        res = await query.order("date", desc=False).range(offset, offset + page_size - 1).execute()
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return [StaffAttendanceOut(**row) for row in rows]
 
 
 async def _purge_expired_attendance(school_id: str, today: date | None = None) -> None:
@@ -152,6 +167,7 @@ async def mark_staff_attendance(
                     "user_id": body.user_id,
                     "date": normalized_date,
                     **payload,
+
                 }
             )
             .execute()
@@ -161,6 +177,15 @@ async def mark_staff_attendance(
         row = inserted.data[0]
 
     await _purge_expired_attendance(school_id)
+
+    status_label = body.status.replace("_", " ").title()
+    await notify_users(
+        school_id,
+        [body.user_id],
+        f"Attendance: {status_label}",
+        f"Your attendance was marked {status_label.lower()} on {normalized_date} by {marked_by}.",
+    )
+
     return StaffAttendanceOut(
         id=row["id"],
         user_id=row["user_id"],
@@ -401,6 +426,7 @@ async def my_staff_attendance_summary(
         school_id,
         max(fetch_start, retention_start_date).isoformat(),
         max(period_end, period_start).isoformat(),
+        user_id=user_id,
     )
     marks_by_date = {
         row.date: row.status for row in marks if row.user_id == user_id

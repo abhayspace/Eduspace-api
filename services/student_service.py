@@ -2,13 +2,14 @@
 import logging
 import secrets
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 from fastapi import HTTPException, status
 
 from database import get_client
 from schemas.people import (
     CredentialsOut,
+    StudentClassFieldsIn,
     StudentCreateIn,
     StudentCreateOut,
     StudentDocumentItem,
@@ -19,7 +20,7 @@ from schemas.people import (
     StudentUpdateIn,
 )
 from utils.codes import generate_admission_no, generate_temp_password, generate_user_code, normalize_admission_no
-from utils.security import hash_password
+from utils.security import hash_password, verify_password
 
 logger = logging.getLogger("eduspace.students")
 
@@ -178,6 +179,7 @@ def _build_student_out(user: dict, profile: dict, class_name: Optional[str] = No
         alternate_mobile=profile.get("alternate_mobile"),
         address=profile.get("address") or user.get("address"),
         transport=profile.get("transport"),
+        house=profile.get("house"),
         class_id=profile.get("class_id"),
         section_id=profile.get("section_id"),
         class_name=class_name,
@@ -212,19 +214,36 @@ async def list_students(
         query = query.eq("class_id", class_id)
     if section_id:
         query = query.eq("section_id", section_id)
-    res = await query.order("created_at", desc=True).limit(500).execute()
-    if not res.data:
+    # Paginate — PostgREST caps responses (~1000 rows); a fixed .limit() would
+    # silently drop students for schools above the cap.
+    page_size = 1000
+    rows: list = []
+    offset = 0
+    while True:
+        res = await (
+            query.order("created_at", desc=True)
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    if not rows:
         return []
-    user_ids = [p["user_id"] for p in res.data if p.get("user_id")]
-    users_res = await client.table("users").select(
-        "id,email,full_name,mobile,user_code,admission_no,is_active,gender,dob,address,photo_url,login_password"
-    ).in_("id", user_ids).execute()
-    users_map = {u["id"]: u for u in (users_res.data or [])}
+    user_ids = [p["user_id"] for p in rows if p.get("user_id")]
+    users_map: dict = {}
+    for i in range(0, len(user_ids), 200):
+        users_res = await client.table("users").select(
+            "id,email,full_name,mobile,user_code,admission_no,is_active,gender,dob,address,photo_url,login_password"
+        ).in_("id", user_ids[i : i + 200]).execute()
+        users_map.update({u["id"]: u for u in (users_res.data or [])})
 
     # Batch-resolve class and section names to avoid N+1 queries.
     # Collect unique class_ids and section_ids, then fetch in 2 queries.
-    class_ids = {p.get("class_id") for p in res.data if p.get("class_id")}
-    section_ids = {p.get("section_id") for p in res.data if p.get("section_id")}
+    class_ids = {p.get("class_id") for p in rows if p.get("class_id")}
+    section_ids = {p.get("section_id") for p in rows if p.get("section_id")}
     class_names_map: dict = {}
     section_names_map: dict = {}
     if class_ids:
@@ -235,7 +254,7 @@ async def list_students(
         section_names_map = {s["id"]: s["name"] for s in (sec_res.data or [])}
 
     out = []
-    for p in res.data:
+    for p in rows:
         user = users_map.get(p.get("user_id"))
         if not user:
             continue
@@ -252,6 +271,91 @@ async def list_students(
         sn = section_names_map.get(p.get("section_id"))
         out.append(_build_student_out(user, p, cn, sn))
     return sorted(out, key=lambda s: (s.class_name or "", s.roll_no or "", s.full_name.lower()))
+
+
+async def teacher_allowed_class_sections(
+    school_id: str, user_id: str
+) -> Tuple[Set[str], Set[str]]:
+    """Class/sections a teacher teaches → (allowed_section_ids, all_sections_class_ids).
+
+    Sources: classes_teaching assignments ("Class - Section" / "Class - All
+    Sections"), the class-teacher assignment, and timetable period assignments.
+    """
+    client = get_client()
+    teacher_res = (
+        await client.table("teachers")
+        .select("id,classes_teaching,is_class_teacher,class_teacher_class_id,class_teacher_section_id")
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not teacher_res.data:
+        return set(), set()
+    profile = teacher_res.data[0]
+
+    # Timetable period assignments.
+    timetable_res = (
+        await client.table("class_section_period_assignments")
+        .select("section_id")
+        .eq("school_id", school_id)
+        .eq("teacher_id", profile["id"])
+        .execute()
+    )
+    section_ids = {
+        row["section_id"]
+        for row in (timetable_res.data or [])
+        if row.get("section_id")
+    }
+
+    # Class-teacher assignment.
+    if profile.get("is_class_teacher") and profile.get("class_teacher_section_id"):
+        section_ids.add(profile["class_teacher_section_id"])
+
+    # classes_teaching assignments ("Class - Section" / "Class - All Sections").
+    assignments = [
+        str(entry).strip()
+        for entry in (profile.get("classes_teaching") or [])
+        if str(entry).strip()
+    ]
+    class_ids_all: Set[str] = set()
+    if assignments:
+        cls_res = (
+            await client.table("classes")
+            .select("id,name")
+            .eq("school_id", school_id)
+            .execute()
+        )
+        sec_res = (
+            await client.table("sections")
+            .select("id,class_id,name")
+            .eq("school_id", school_id)
+            .execute()
+        )
+        class_by_name = {
+            str(c.get("name") or "").strip().lower(): c["id"]
+            for c in (cls_res.data or [])
+            if c.get("name")
+        }
+        section_by_key = {
+            (s.get("class_id"), str(s.get("name") or "").strip().lower()): s["id"]
+            for s in (sec_res.data or [])
+            if s.get("name")
+        }
+        for value in assignments:
+            cut = value.rfind(" - ")
+            entry_class = (value[:cut] if cut > 0 else value).strip().lower()
+            entry_section = value[cut + 3 :].strip().lower() if cut > 0 else ""
+            class_id = class_by_name.get(entry_class)
+            if not class_id:
+                continue
+            if not entry_section or entry_section == "all sections":
+                class_ids_all.add(class_id)
+            else:
+                section_id = section_by_key.get((class_id, entry_section))
+                if section_id:
+                    section_ids.add(section_id)
+    return section_ids, class_ids_all
 
 
 async def get_student(school_id: str, student_id: str) -> StudentOut:
@@ -440,6 +544,67 @@ async def get_children_for_parent(school_id: str, user_id: str) -> List[StudentO
         ct_name = await _resolve_class_teacher_name(school_id, profile.get("class_id"), profile.get("section_id"))
         children.append(_build_student_out(user_res.data[0], profile, cn, sn, ct_name))
     return children
+
+
+async def link_child_for_parent(
+    school_id: str, parent_user_id: str, admission_no: str, password: str
+) -> StudentOut:
+    """Link an additional child to a parent account, verified by the child's credentials."""
+    client = get_client()
+    ident = (admission_no or "").strip()
+    candidates = [ident]
+    if ident.isdigit():
+        n = int(ident)
+        candidates = list(dict.fromkeys([ident, str(n), f"{n:04d}", f"{n:05d}"]))
+    elif ident:
+        candidates.append(ident.upper())
+    user_res = (
+        await client.table("users")
+        .select("id,password_hash,login_password")
+        .eq("school_id", school_id)
+        .eq("role", "student")
+        .in_("admission_no", candidates)
+        .limit(1)
+        .execute()
+    )
+    if not user_res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No student found with that admission number")
+    student_user = user_res.data[0]
+    ok = verify_password(password, student_user.get("password_hash") or "") or (
+        bool(password) and (student_user.get("login_password") or "") == password
+    )
+    if not ok:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect password for that student")
+    sp = (
+        await client.table("students")
+        .select("id")
+        .eq("school_id", school_id)
+        .eq("user_id", student_user["id"])
+        .limit(1)
+        .execute()
+    )
+    if not sp.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student profile not found")
+    student_id = sp.data[0]["id"]
+    existing = (
+        await client.table("parents")
+        .select("id")
+        .eq("school_id", school_id)
+        .eq("user_id", parent_user_id)
+        .eq("student_id", student_id)
+        .limit(1)
+        .execute()
+    )
+    if not existing.data:
+        await client.table("parents").insert(
+            {
+                "school_id": school_id,
+                "user_id": parent_user_id,
+                "student_id": student_id,
+                "relation": "guardian",
+            }
+        ).execute()
+    return await get_student_by_user_id(school_id, student_user["id"])
 
 
 async def get_child_medical_for_parent(
@@ -791,6 +956,8 @@ async def update_student(school_id: str, student_id: str, body: StudentUpdateIn)
         profile_updates["alternate_mobile"] = body.alternate_mobile
     if "transport" in body.model_fields_set:
         profile_updates["transport"] = (body.transport or "").strip() or None
+    if "house" in body.model_fields_set:
+        profile_updates["house"] = (body.house or "").strip() or None
     if "aadhar_number" in body.model_fields_set and body.aadhar_number is None:
         profile_updates["aadhar_number"] = None
     if body.documents is not None:
@@ -811,6 +978,59 @@ async def update_student(school_id: str, student_id: str, body: StudentUpdateIn)
 
     if body.full_name:
         await client.table("users").update({"full_name": body.full_name}).eq("id", profile["user_id"]).execute()
+
+    return await get_student(school_id, student_id)
+
+
+async def update_student_class_fields(
+    school_id: str,
+    teacher_user_id: str,
+    student_id: str,
+    body: StudentClassFieldsIn,
+) -> StudentOut:
+    """Class teachers may edit roll_no/house/transport for students in their
+    own class-section only."""
+    client = get_client()
+    teacher_res = (
+        await client.table("teachers")
+        .select("is_class_teacher,class_teacher_class_id,class_teacher_section_id")
+        .eq("school_id", school_id)
+        .eq("user_id", teacher_user_id)
+        .limit(1)
+        .execute()
+    )
+    profile = (teacher_res.data or [{}])[0] if teacher_res.data else {}
+    ct_class_id = profile.get("class_teacher_class_id")
+    ct_section_id = profile.get("class_teacher_section_id")
+    if not (profile.get("is_class_teacher") and ct_class_id and ct_section_id):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Only the assigned class teacher can edit class fields"
+        )
+
+    student_res = (
+        await client.table("students")
+        .select("class_id,section_id")
+        .eq("school_id", school_id)
+        .eq("id", student_id)
+        .limit(1)
+        .execute()
+    )
+    if not student_res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+    student = student_res.data[0]
+    if student.get("class_id") != ct_class_id or student.get("section_id") != ct_section_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Student is not in your class")
+
+    updates: dict = {}
+    if "roll_no" in body.model_fields_set:
+        updates["roll_no"] = (body.roll_no or "").strip() or None
+    if "house" in body.model_fields_set:
+        updates["house"] = (body.house or "").strip() or None
+    if "transport" in body.model_fields_set:
+        updates["transport"] = (body.transport or "").strip() or None
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await client.table("students").update(updates).eq("id", student_id).execute()
 
     return await get_student(school_id, student_id)
 
@@ -933,6 +1153,45 @@ async def list_my_medical_visits(school_id: str, user_id: str) -> List[StudentMe
     """
     client = get_client()
     visit_user_id = await _resolve_student_user_id(school_id, user_id) or user_id
+    res = (
+        await client.table(STUDENT_VISITS_TABLE)
+        .select("*")
+        .eq("school_id", school_id)
+        .eq("user_id", visit_user_id)
+        .order("visit_date", desc=True)
+        .limit(200)
+        .execute()
+    )
+    return [_build_student_visit_out(row) for row in (res.data or [])]
+
+
+async def list_child_medical_visits_for_parent(
+    school_id: str, parent_user_id: str, student_id: str
+) -> List[StudentMedicalVisitOut]:
+    """Medical-room visits for a linked child, guarded by the parent link."""
+    client = get_client()
+    link = (
+        await client.table("parents")
+        .select("id")
+        .eq("school_id", school_id)
+        .eq("user_id", parent_user_id)
+        .eq("student_id", student_id)
+        .limit(1)
+        .execute()
+    )
+    if not link.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Child not linked to this parent")
+    profile_res = (
+        await client.table("students")
+        .select("user_id")
+        .eq("school_id", school_id)
+        .eq("id", student_id)
+        .limit(1)
+        .execute()
+    )
+    if not profile_res.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student profile not found")
+    visit_user_id = profile_res.data[0].get("user_id")
     res = (
         await client.table(STUDENT_VISITS_TABLE)
         .select("*")

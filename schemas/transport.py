@@ -86,6 +86,9 @@ class TransportVehicleBase(BaseModel):
     registration_expiry: Optional[date] = None
     insurance_expiry: Optional[date] = None
     notes: Optional[str] = None
+    # none | phone | traccar | vendor
+    tracking_source: str = "none"
+    tracker_device_id: Optional[str] = None
 
 
 class TransportVehicleCreateIn(TransportVehicleBase):
@@ -105,6 +108,31 @@ class TransportVehicleUpdateIn(BaseModel):
     insurance_expiry: Optional[date] = None
     notes: Optional[str] = None
     is_archived: Optional[bool] = None
+    tracking_source: Optional[str] = None
+    tracker_device_id: Optional[str] = None
+
+
+class TransportVehicleLocationIn(BaseModel):
+    latitude: float
+    longitude: float
+    speed: Optional[float] = None
+    heading: Optional[float] = None
+    recorded_at: Optional[datetime] = None
+
+
+class TransportVehicleLocationOut(BaseModel):
+    vehicle_id: str
+    latitude: float
+    longitude: float
+    speed: Optional[float] = None
+    heading: Optional[float] = None
+    source: str = "phone"
+    recorded_at: Optional[datetime] = None
+
+
+class TransportConfigOut(BaseModel):
+    map_tile_url: str
+    map_attribution: str
 
 
 class TransportVehicleOut(BaseModel):
@@ -125,6 +153,8 @@ class TransportVehicleOut(BaseModel):
     insurance_expiry: Optional[date] = None
     notes: Optional[str] = None
     is_archived: bool = False
+    tracking_source: str = "none"
+    tracker_device_id: Optional[str] = None
     assigned_students: int = 0
     available_seats: int = 0
     created_at: Optional[datetime] = None

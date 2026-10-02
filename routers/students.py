@@ -6,7 +6,9 @@ from fastapi.responses import FileResponse
 
 from database import get_client
 from schemas.people import (
+    ChildLinkIn,
     ResetPasswordOut,
+    StudentClassFieldsIn,
     StudentCreateIn,
     StudentCreateOut,
     StudentDocumentOut,
@@ -102,6 +104,18 @@ async def get_my_children(
     return [k.model_copy(update={"login_password": None}) for k in kids]
 
 
+@router.post("/me/children", response_model=StudentOut)
+async def link_my_child(
+    body: ChildLinkIn,
+    user: dict = Depends(require_roles("parent")),
+) -> StudentOut:
+    """Link another child (admission no + student password) to this parent."""
+    child = await student_service.link_child_for_parent(
+        user["school_id"], user["id"], body.admission_no, body.password
+    )
+    return child.model_copy(update={"login_password": None})
+
+
 @router.get("/me/children/{student_id}/medical", response_model=StudentMedicalOut)
 async def get_child_medical(
     student_id: str,
@@ -111,6 +125,63 @@ async def get_child_medical(
     return await student_service.get_child_medical_for_parent(
         user["school_id"], user["id"], student_id
     )
+
+
+@router.get("/me/children/{student_id}/medical/visits", response_model=List[StudentMedicalVisitOut])
+async def list_child_medical_visits(
+    student_id: str,
+    user: dict = Depends(require_roles("parent")),
+) -> List[StudentMedicalVisitOut]:
+    """Medical-room visits of a linked child for the parent."""
+    return await student_service.list_child_medical_visits_for_parent(
+        user["school_id"], user["id"], student_id
+    )
+
+
+@router.get("/me/fees-access")
+async def get_my_fees_access(
+    user: dict = Depends(require_roles("student")),
+) -> dict:
+    """Whether the linked parent allows this student to see the Fees shortcut.
+
+    Defaults to allowed when no parent is linked or the column isn't there yet.
+    If multiple parents are linked, any one of them can disable it.
+    """
+    client = get_client()
+    try:
+        profile = (
+            await client.table("students")
+            .select("id")
+            .eq("school_id", user["school_id"])
+            .eq("user_id", user["id"])
+            .limit(1)
+            .execute()
+        )
+        if not profile.data:
+            return {"allowed": True}
+        links = (
+            await client.table("parents")
+            .select("user_id")
+            .eq("school_id", user["school_id"])
+            .eq("student_id", profile.data[0]["id"])
+            .execute()
+        )
+        parent_ids = [row["user_id"] for row in (links.data or []) if row.get("user_id")]
+        if not parent_ids:
+            return {"allowed": True}
+        parents_res = (
+            await client.table("users")
+            .select("allow_student_fees_access")
+            .in_("id", parent_ids)
+            .execute()
+        )
+        allowed = all(
+            bool(row.get("allow_student_fees_access", True))
+            for row in (parents_res.data or [])
+        )
+        return {"allowed": allowed}
+    except Exception:
+        return {"allowed": True}
 
 
 @router.get("/me/classmates")
@@ -215,6 +286,17 @@ async def list_students(
         search,
         approval_status="approved",
     )
+    # Teachers may only view students from the classes/sections they teach.
+    if user.get("role") == "teacher":
+        allowed_sections, allowed_classes = (
+            await student_service.teacher_allowed_class_sections(school_id, user["id"])
+        )
+        rows = [
+            row
+            for row in rows
+            if (row.section_id and row.section_id in allowed_sections)
+            or (row.class_id and row.class_id in allowed_classes)
+        ]
     return [_strip_password_for_teacher(row, user) for row in rows]
 
 
@@ -277,6 +359,20 @@ async def create_student(
         await broadcast_directory_changed(user["school_id"])
         return out
     out = await student_service.create_student(user["school_id"], body)
+    await broadcast_directory_changed(user["school_id"])
+    return out
+
+
+@router.patch("/{student_id}/class-fields", response_model=StudentOut)
+async def update_student_class_fields(
+    student_id: str,
+    body: StudentClassFieldsIn,
+    user: dict = Depends(require_roles("teacher")),
+) -> StudentOut:
+    """Class teacher edits roll_no / house / transport for students in their own class."""
+    out = await student_service.update_student_class_fields(
+        user["school_id"], user["id"], student_id, body
+    )
     await broadcast_directory_changed(user["school_id"])
     return out
 

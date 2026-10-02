@@ -109,6 +109,7 @@ class SchoolBrandOut(BaseModel):
     app_display_name: Optional[str] = Field(default=None, alias="appDisplayName")
     logo_url: Optional[str] = Field(default=None, alias="logoUrl")
     use_school_logo: bool = Field(default=False, alias="useSchoolLogo")
+    app_icon_key: Optional[str] = Field(default=None, alias="appIconKey")
     school_email: Optional[str] = Field(default=None, alias="schoolEmail")
     school_phone: Optional[str] = Field(default=None, alias="schoolPhone")
     address: Optional[str] = None
@@ -146,11 +147,29 @@ class SchoolProfileOut(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class WebsiteAccessCodeIn(BaseModel):
+    access_code: Optional[str] = Field(default=None, alias="accessCode", min_length=6, max_length=6)
+
+    model_config = {"populate_by_name": True}
+
+
+class WebsiteAccessCodeStatusOut(BaseModel):
+    has_code: bool = Field(alias="hasCode")
+    created_at: Optional[str] = Field(default=None, alias="createdAt")
+
+    model_config = {"populate_by_name": True}
+
+
+class WebsiteAccessCodeOut(WebsiteAccessCodeStatusOut):
+    access_code: str = Field(alias="accessCode")
+
+
 class SchoolProfileUpdateIn(BaseModel):
     """Editable school profile fields. Email changes require OTP verification."""
 
     app_display_name: Optional[str] = Field(default=None, alias="appDisplayName")
     use_school_logo: Optional[bool] = Field(default=None, alias="useSchoolLogo")
+    app_icon_key: Optional[str] = Field(default=None, alias="appIconKey")
     education_board: Optional[str] = Field(default=None, alias="educationBoard")
     established_date: Optional[str] = Field(default=None, alias="establishedDate")
     school_email: Optional[EmailStr] = Field(default=None, alias="schoolEmail")

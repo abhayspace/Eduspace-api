@@ -15,6 +15,30 @@ from schemas.leave_requests import (
 TABLE = "leave_requests"
 RETENTION_DAYS = 90
 
+
+async def _notify_new_request(school_id: str, requester: dict, reviewer_user_id: str | None, title: str) -> None:
+    """Tell the reviewer(s) a new leave request arrived. Best-effort."""
+    from services.notification_service import notify_school_roles, notify_users
+
+    body = f"{requester.get('full_name') or 'Someone'} submitted \"{title}\" — tap to review."
+    if reviewer_user_id:
+        await notify_users(school_id, [reviewer_user_id], "New leave request", body)
+    else:
+        await notify_school_roles(
+            school_id, sorted(REVIEWER_ROLES), "New leave request", body,
+            exclude_user_id=requester.get("id"),
+        )
+
+
+async def _notify_decision(school_id: str, row: dict, decision: str) -> None:
+    """Tell the requester their leave request was approved/rejected. Best-effort."""
+    from services.notification_service import notify_users
+
+    verb = "approved" if decision == "approved" else "rejected"
+    title = f"Leave request {verb}"
+    body = f"Your leave request \"{row.get('title') or 'Leave'}\" was {verb}."
+    await notify_users(school_id, [row["user_id"]], title, body)
+
 # Roles that review leave requests instead of submitting them.
 REVIEWER_ROLES = {"school_admin", "principal", "vice_principal", "super_admin"}
 
@@ -230,6 +254,7 @@ async def create_leave_request(school_id: str, user: dict, body: LeaveRequestIn)
     )
     if not res.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create leave request")
+    await _notify_new_request(school_id, user, reviewer_user_id, body.title.strip())
     return _out(res.data[0])
 
 
@@ -295,6 +320,26 @@ async def _auto_mark_teacher_leave(school_id: str, user_id: str, start_date: str
         current += timedelta(days=1)
 
 
+async def _remove_teacher_leave_marks(school_id: str, user_id: str, start_date: str, end_date: str) -> None:
+    """Delete the staff_attendance 'leave' rows an approved request auto-created.
+
+    Only removes rows with status 'leave' marked by the leave system — a row an
+    admin later re-marked (present/absent) is left alone.
+    """
+    client = get_client()
+    await (
+        client.table("staff_attendance")
+        .delete()
+        .eq("school_id", school_id)
+        .eq("user_id", user_id)
+        .eq("status", "leave")
+        .eq("marked_by", "Leave Request System")
+        .gte("date", start_date)
+        .lte("date", end_date)
+        .execute()
+    )
+
+
 async def decide_leave_request(
     school_id: str, user: dict, request_id: str, body: LeaveRequestDecisionIn
 ) -> LeaveRequestOut:
@@ -348,6 +393,9 @@ async def decide_leave_request(
             row["end_date"],
         )
 
+    if body.status in ("approved", "rejected"):
+        await _notify_decision(school_id, row, body.status)
+
     return updated
 
 
@@ -374,5 +422,20 @@ async def cancel_leave_request(
         .execute()
     )
     if res.data:
-        return _out(res.data[0])
-    return _out(await _row(school_id, request_id))
+        updated = _out(res.data[0])
+    else:
+        updated = _out(await _row(school_id, request_id))
+
+    # Remove the leave marks written into staff attendance at approval.
+    if row.get("user_role") in ("teacher", "principal", "vice_principal", "school_admin", "super_admin", "office_staff"):
+        try:
+            await _remove_teacher_leave_marks(
+                school_id,
+                row["user_id"],
+                row["start_date"],
+                row["end_date"],
+            )
+        except Exception:
+            pass
+
+    return updated

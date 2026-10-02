@@ -29,7 +29,13 @@ async def update_settings(
     body: CalendarSettingsUpdateIn,
     user: dict = Depends(require_roles(*_WRITE_ROLES)),
 ) -> CalendarSettingsOut:
-    return await calendar_service.update_settings(user["school_id"], body.open_on_sunday)
+    return await calendar_service.update_settings(
+        user["school_id"],
+        open_on_sunday=body.open_on_sunday,
+        allow_parent_teacher_chat=body.allow_parent_teacher_chat,
+        teacher_can_create_post=body.teacher_can_create_post,
+        student_can_create_post=body.student_can_create_post,
+    )
 
 
 @router.get("/month", response_model=CalendarMonthOut)

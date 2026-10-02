@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, status
 
 from database import get_client
 from schemas.content import NotificationFeedItem, NotificationItem, RegisterPushIn
-from services.notification_feed_service import get_notification_feed
+from services.notification_feed_service import get_notification_feed, mark_feed_seen
 from services.notification_service import register_device
 from utils.deps import current_user
 
@@ -49,10 +49,12 @@ async def mark_all_notifications_read(user: dict = Depends(current_user)) -> dic
     client = get_client()
     await (
         client.table("notifications")
+        .update({"is_read": True})
         .eq("school_id", user["school_id"])
         .eq("user_id", user["id"])
         .eq("is_read", False)
-        .update({"is_read": True})
         .execute()
     )
+    # Also pin the feed's synthesized items (announcements, forms, fees…)
+    await mark_feed_seen(user["school_id"], user["id"])
     return {"status": "ok"}

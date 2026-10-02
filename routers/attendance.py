@@ -16,7 +16,7 @@ from schemas.content import (
     StaffAttendanceSummaryOut,
 )
 from services import class_student_attendance_service, staff_attendance_service
-from services.notification_service import notify_school
+from services.notification_service import notify_school_roles, notify_student_and_parents
 from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/attendance", tags=["attendance"])
@@ -25,19 +25,24 @@ _COLUMNS = "id,school_id,student_email,class_name,date,status"
 _STAFF_MARK_ROLES = ("teacher", "principal", "school_admin", "vice_principal", "super_admin")
 
 
-async def _student_email_for_user(user: dict) -> str:
-    """Resolve the attendance student_email — parents map to their linked child."""
+async def _student_email_for_user(user: dict, student_id: Optional[str] = None) -> str:
+    """Resolve the attendance student_email — parents map to a linked child.
+
+    Parents may pass ``student_id`` (students.id) to pick a specific linked
+    child; the link is enforced by filtering the parents row.
+    """
     if user.get("role") != "parent":
         return user["email"]
     client = get_client()
-    link = (
-        await client.table("parents")
+    link_query = (
+        client.table("parents")
         .select("student_id")
         .eq("school_id", user["school_id"])
         .eq("user_id", user["id"])
-        .limit(1)
-        .execute()
     )
+    if student_id:
+        link_query = link_query.eq("student_id", student_id)
+    link = await link_query.limit(1).execute()
     if not link.data:
         return user["email"]
     student = (
@@ -60,13 +65,16 @@ async def _student_email_for_user(user: dict) -> str:
 
 
 @router.get("/me", response_model=List[AttendanceRec])
-async def my_attendance(user: dict = Depends(current_user)) -> List[AttendanceRec]:
+async def my_attendance(
+    student_id: Optional[str] = Query(None),
+    user: dict = Depends(current_user),
+) -> List[AttendanceRec]:
     client = get_client()
     res = (
         await client.table("attendance")
         .select(_COLUMNS)
         .eq("school_id", user["school_id"])
-        .eq("student_email", await _student_email_for_user(user))
+        .eq("student_email", await _student_email_for_user(user, student_id))
         .order("date", desc=True)
         .limit(100)
         .execute()
@@ -173,6 +181,37 @@ async def mark_attendance(
     inserted = await client.table("attendance").insert(row).execute()
     if not inserted.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to mark attendance")
+
+    # Notify the student and their linked parents (best-effort).
+    stu_user = (
+        await client.table("users")
+        .select("id")
+        .eq("school_id", user["school_id"])
+        .eq("email", body.student_email)
+        .limit(1)
+        .execute()
+    )
+    if stu_user.data:
+        stu_user_id = stu_user.data[0]["id"]
+        stu_profile = (
+            await client.table("students")
+            .select("id")
+            .eq("school_id", user["school_id"])
+            .eq("user_id", stu_user_id)
+            .limit(1)
+            .execute()
+        )
+        status_label = body.status.replace("_", " ").title()
+        await notify_student_and_parents(
+            user["school_id"],
+            stu_profile.data[0]["id"] if stu_profile.data else None,
+            stu_user_id,
+            f"Attendance: {status_label}",
+            f"Marked {status_label.lower()} on {body.date}"
+            + (f" ({body.class_name})." if body.class_name else "."),
+            exclude_user_id=user["id"],
+        )
+
     return AttendanceRec(**inserted.data[0])
 
 
@@ -402,7 +441,13 @@ async def confirm_holiday(
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create announcement")
 
     created = Announcement(**inserted.data[0])
-    await notify_school(school_id, f"Holiday Confirmation: {body.holiday_title}", body_text)
+    # Staff-side roles created this — notify students, parents and teachers only.
+    await notify_school_roles(
+        school_id,
+        ["teacher", "student", "parent"],
+        f"Holiday Confirmation: {body.holiday_title}",
+        body_text,
+    )
     return created
 
 

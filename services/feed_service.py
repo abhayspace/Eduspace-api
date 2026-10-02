@@ -187,6 +187,29 @@ async def _is_restricted(school_id: str, user_id: str) -> bool:
     return bool(res.data)
 
 
+async def _posting_allowed_for_role(school_id: str, role: str) -> bool:
+    """School-level switches: teachers/students can be blocked from posting."""
+    column = {
+        "teacher": "teacher_can_create_post",
+        "student": "student_can_create_post",
+        "parent": "student_can_create_post",
+    }.get(role)
+    if not column:
+        return True
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select(column)
+        .eq("id", school_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        return True
+    value = res.data[0].get(column)
+    return True if value is None else bool(value)
+
+
 async def create_post(school_id: str, user: dict, body: FeedPostCreateIn) -> FeedPostOut:
     caption = (body.caption or "").strip()
     media_urls = [u for u in (body.media_urls or []) if u]
@@ -199,6 +222,13 @@ async def create_post(school_id: str, user: dict, body: FeedPostCreateIn) -> Fee
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "You are restricted from posting to the School Feed. Contact your school admin.",
+        )
+
+    role = user.get("role") or ""
+    if role not in _ADMIN_ROLES and not await _posting_allowed_for_role(school_id, role):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Posting to the School Feed is turned off for your role. Contact your school admin.",
         )
 
     client = get_client()

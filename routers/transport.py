@@ -21,7 +21,10 @@ from schemas.transport import (
     TransportStaffUpdateIn,
     TransportUpdateCreateIn,
     TransportUpdateOut,
+    TransportConfigOut,
     TransportVehicleCreateIn,
+    TransportVehicleLocationIn,
+    TransportVehicleLocationOut,
     TransportVehicleOut,
     TransportVehicleUpdateIn,
 )
@@ -45,6 +48,20 @@ async def transport_dashboard(user: dict = Depends(_manager_dep)) -> TransportDa
 @router.get("/analytics", response_model=TransportAnalyticsOut)
 async def transport_analytics(user: dict = Depends(_admin_dep)) -> TransportAnalyticsOut:
     return await svc.get_analytics(user["school_id"], user)
+
+
+# ---------------------------------------------------------------------------
+# Map config + live tracking
+# ---------------------------------------------------------------------------
+@router.get("/config", response_model=TransportConfigOut)
+async def transport_config(user: dict = Depends(current_user)) -> TransportConfigOut:
+    """Map tile URL + attribution for the live bus map (no Google key needed)."""
+    return await svc.get_map_config()
+
+
+@router.get("/my-transport/location", response_model=TransportVehicleLocationOut)
+async def my_transport_location(user: dict = Depends(current_user)) -> TransportVehicleLocationOut:
+    return await svc.get_my_transport_location(user["school_id"], user)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +158,23 @@ async def update_vehicle_status(
         status=body.get("status", ""),
         maintenance_status=body.get("maintenance_status"),
     )
+
+
+@router.post("/vehicles/{vehicle_id}/location", response_model=TransportVehicleLocationOut)
+async def report_vehicle_location(
+    vehicle_id: str,
+    body: TransportVehicleLocationIn,
+    user: dict = Depends(_manager_dep),
+) -> TransportVehicleLocationOut:
+    """Driver/manager phone pushes the vehicle's GPS fix."""
+    return await svc.report_vehicle_location(user["school_id"], vehicle_id, user, body)
+
+
+@router.get("/vehicles/{vehicle_id}/location", response_model=TransportVehicleLocationOut)
+async def get_vehicle_location(
+    vehicle_id: str, user: dict = Depends(_manager_dep)
+) -> TransportVehicleLocationOut:
+    return await svc.get_vehicle_location(user["school_id"], vehicle_id, user)
 
 
 @router.delete("/vehicles/{vehicle_id}", status_code=status.HTTP_204_NO_CONTENT)

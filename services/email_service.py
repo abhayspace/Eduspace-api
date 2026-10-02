@@ -42,6 +42,9 @@ def _send_sync(
     body_text: str,
     body_html: str | None = None,
     reply_to: str | None = None,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    attachments: list[dict] | None = None,
 ) -> bool:
     settings = get_settings()
     api_key = (settings.resend_api_key or "").strip()
@@ -69,6 +72,12 @@ def _send_sync(
     }
     if reply_to:
         params["reply_to"] = reply_to
+    if cc:
+        params["cc"] = cc
+    if bcc:
+        params["bcc"] = bcc
+    if attachments:
+        params["attachments"] = attachments
 
     try:
         result = resend.Emails.send(params)
@@ -100,9 +109,26 @@ async def send_email(
     body_text: str,
     body_html: str | None = None,
     reply_to: str | None = None,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    attachments: list[dict] | None = None,
 ) -> bool:
-    """Send an email without blocking the event loop."""
-    return await asyncio.to_thread(_send_sync, to_address, subject, body_text, body_html, reply_to)
+    """Send an email without blocking the event loop.
+
+    ``attachments`` is a list of ``{"filename": str, "content": <base64>}`` dicts
+    in the format expected by the Resend API.
+    """
+    return await asyncio.to_thread(
+        _send_sync,
+        to_address,
+        subject,
+        body_text,
+        body_html,
+        reply_to,
+        cc,
+        bcc,
+        attachments,
+    )
 
 
 async def send_support_query_email(

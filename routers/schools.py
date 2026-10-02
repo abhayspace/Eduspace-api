@@ -23,10 +23,14 @@ from schemas.school import (
     TrialRegisterOut,
     TrialStatusOut,
     VerifyCodeIn,
+    WebsiteAccessCodeIn,
+    WebsiteAccessCodeOut,
+    WebsiteAccessCodeStatusOut,
 )
 from services.otp_service import clear, is_verified
 from services.school_logo_service import resolve_school_logo, save_school_logo_bytes
 from services.school_service import register_school
+from services.web_access_service import generate_access_code, get_access_code_status, save_access_code
 from services.trial_service import (
     check_and_expire_trials,
     convert_trial_to_permanent,
@@ -451,7 +455,7 @@ async def get_my_school_brand(user: dict = Depends(current_user)) -> SchoolBrand
     client = get_client()
     res = (
         await client.table("schools")
-        .select("school_name,app_display_name,logo_url,use_school_logo,email,phone,address,city")
+        .select("school_name,app_display_name,logo_url,use_school_logo,app_icon_key,email,phone,address,city")
         .eq("id", school_id)
         .limit(1)
         .execute()
@@ -464,6 +468,7 @@ async def get_my_school_brand(user: dict = Depends(current_user)) -> SchoolBrand
         app_display_name=row.get("app_display_name"),
         logo_url=row.get("logo_url"),
         use_school_logo=bool(row.get("use_school_logo", False)),
+        app_icon_key=row.get("app_icon_key"),
         school_email=row.get("email"),
         school_phone=row.get("phone"),
         address=row.get("address"),
@@ -481,6 +486,31 @@ async def get_my_school_profile(
     row = await _fetch_school_profile_row(school_id)
     admin_user = await _fetch_school_admin_user(school_id)
     return _to_profile(row, admin_user or user)
+
+
+@router.get("/website-access-code", response_model=WebsiteAccessCodeStatusOut)
+async def website_access_code_status(
+    user: dict = Depends(require_roles("school_admin")),
+) -> WebsiteAccessCodeStatusOut:
+    if user.get("web_access_only"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Website access accounts cannot manage access codes")
+    status_row = await get_access_code_status(user["school_id"])
+    return WebsiteAccessCodeStatusOut(**status_row)
+
+
+@router.post("/website-access-code", response_model=WebsiteAccessCodeOut)
+async def create_website_access_code(
+    body: WebsiteAccessCodeIn,
+    user: dict = Depends(require_roles("school_admin")),
+) -> WebsiteAccessCodeOut:
+    if user.get("web_access_only"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Website access accounts cannot manage access codes")
+    code = (body.access_code or generate_access_code()).strip()
+    if len(code) != 6 or not code.isdigit():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Access code must be exactly 6 digits")
+    await save_access_code(user["school_id"], code, user["id"])
+    status_row = await get_access_code_status(user["school_id"])
+    return WebsiteAccessCodeOut(**status_row, access_code=code)
 
 
 @router.get("/{school_id}/logo/{filename}")
@@ -544,6 +574,14 @@ async def update_my_school_profile(
                 "Upload your school logo in School Profile first, then try again.",
             )
         updates["use_school_logo"] = body.use_school_logo
+    if body.app_icon_key is not None:
+        key = body.app_icon_key.strip()
+        if key and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", key):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "App icon key must start with a letter and contain only letters, numbers, and underscores",
+            )
+        updates["app_icon_key"] = key or None
     if body.education_board is not None:
         updates["board"] = body.education_board.strip() or None
     if body.established_date is not None:
@@ -661,7 +699,6 @@ async def list_schools() -> List[School]:
 _STAFF_STAT_ROLES = {
     "receptionist", "accountant", "librarian", "transport_manager",
     "hostel_warden", "hostel_manager", "school_doctor",
-    "principal", "vice_principal",
 }
 
 

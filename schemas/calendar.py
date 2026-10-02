@@ -18,6 +18,7 @@ class CalendarEventOut(BaseModel):
     source: str = "school"
     person_type: Optional[str] = None
     person_user_id: Optional[str] = None
+    person_detail: Optional[str] = None
     created_by: Optional[str] = None
     created_at: Optional[datetime] = None
 
@@ -48,7 +49,13 @@ class CalendarEventUpdateIn(BaseModel):
 
 class CalendarSettingsOut(BaseModel):
     open_on_sunday: bool = False
+    allow_parent_teacher_chat: bool = False
+    teacher_can_create_post: bool = True
+    student_can_create_post: bool = True
 
 
 class CalendarSettingsUpdateIn(BaseModel):
-    open_on_sunday: bool
+    open_on_sunday: Optional[bool] = None
+    allow_parent_teacher_chat: Optional[bool] = None
+    teacher_can_create_post: Optional[bool] = None
+    student_can_create_post: Optional[bool] = None

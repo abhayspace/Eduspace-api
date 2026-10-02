@@ -7,7 +7,13 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse, Response
 
-from schemas.receipt import EnsureReceiptIn, EnsureReceiptOut, FeeReceiptListOut, FeeReceiptOut
+from schemas.receipt import (
+    CustomReceiptIn,
+    EnsureReceiptIn,
+    EnsureReceiptOut,
+    FeeReceiptListOut,
+    FeeReceiptOut,
+)
 from services.receipt import receipt_service
 from services.receipt.storage import default_storage
 from utils.deps import current_user, require_roles
@@ -95,6 +101,24 @@ async def admin_ensure_receipt(
         user, body.transaction_id
     )
     return EnsureReceiptOut(**row)
+
+
+@router.post("/admin/receipts/custom", response_model=FeeReceiptOut)
+async def admin_custom_receipt(
+    body: CustomReceiptIn,
+    user: dict = Depends(_FEE_ADMIN),
+) -> FeeReceiptOut:
+    """Generate an ad-hoc school-branded PDF receipt (no linked payment)."""
+    row = await receipt_service.create_custom_receipt(
+        user,
+        student_name=body.student_name,
+        amount=body.amount,
+        student_id=body.student_id,
+        note=body.note,
+        lines=[l.model_dump() for l in body.lines] if body.lines else None,
+        payment_method=body.payment_method,
+    )
+    return FeeReceiptOut(**row)
 
 
 @router.get("/admin/receipts/{receipt_id}")

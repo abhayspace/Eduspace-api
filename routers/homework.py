@@ -11,7 +11,7 @@ from services.homework_attachment_service import (
     resolve_homework_attachment,
     save_homework_attachment,
 )
-from services.notification_service import notify_school
+from services.notification_service import notify_class_users
 from utils.deps import current_user, require_roles
 
 router = APIRouter(prefix="/homework", tags=["homework"])
@@ -79,11 +79,14 @@ async def create_homework(
         attachment_url=body.attachment_url,
         attachment_name=body.attachment_name,
     )
-    await notify_school(
+    await notify_class_users(
         user["school_id"],
+        created.class_name,
+        created.section_name,
         f"New homework: {created.class_name}"
         + (f" {created.section_name}" if created.section_name else ""),
         f"{created.title} — due {created.due_date}",
+        exclude_user_id=user["id"],
     )
     return created
 

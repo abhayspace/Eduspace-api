@@ -20,6 +20,7 @@ from schemas.forgot import LinkEmailIn
 from services import teacher_service
 from services.email_service import send_email
 from services.otp_service import clear, generate_and_store, is_verified, verify
+from services.web_access_service import user_for_access_code
 from routers.forgot import is_gmail, mask_email
 from utils.deps import current_user, current_user_allow_expired
 from utils.security import create_access_token, hash_password, verify_password
@@ -28,7 +29,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger("eduspace.auth")
 
 _LOGIN_COLUMNS = (
-    "id,email,full_name,role,school_id,admission_no,user_code,is_active,password_hash,must_change_password,gender,login_password,dob,mobile,address,occupation,alternate_mobile"
+    "id,email,full_name,role,school_id,admission_no,user_code,is_active,password_hash,must_change_password,gender,login_password,dob,mobile,address,occupation,alternate_mobile,web_access_only"
 )
 
 # Schools where parent login is temporarily disabled while the feature is
@@ -85,6 +86,7 @@ def _to_public(user: dict) -> UserPublic:
         address=user.get("address"),
         occupation=user.get("occupation"),
         alternate_mobile=user.get("alternate_mobile"),
+        web_access_only=bool(user.get("web_access_only")),
     )
 
 
@@ -277,6 +279,37 @@ async def _resolve_parent_login(client, body: LoginIn, ident: str) -> dict:
 
     if parent:
         return parent  # setup pending — student password still accepted
+    # If this student was linked to an existing parent account (My Children add),
+    # log into that account instead of creating a duplicate parent user.
+    student_profile = (
+        await client.table("students")
+        .select("id")
+        .eq("school_id", body.school_id)
+        .eq("user_id", student["id"])
+        .limit(1)
+        .execute()
+    )
+    if student_profile.data:
+        link = (
+            await client.table("parents")
+            .select("user_id")
+            .eq("school_id", body.school_id)
+            .eq("student_id", student_profile.data[0]["id"])
+            .limit(1)
+            .execute()
+        )
+        if link.data:
+            linked = (
+                await client.table("users")
+                .select(_LOGIN_COLUMNS)
+                .eq("school_id", body.school_id)
+                .eq("role", "parent")
+                .eq("id", link.data[0]["user_id"])
+                .limit(1)
+                .execute()
+            )
+            if linked.data:
+                return linked.data[0]
     return await _create_parent_account(client, body.school_id, student)
 
 
@@ -290,7 +323,11 @@ async def login(body: LoginIn) -> TokenOut:
         body.identifier or ""
     ).strip()
 
-    if is_school_portal_login and body.school_id:
+    if body.access_code:
+        if portal_role != "school_admin" or not body.school_id:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid access code")
+        user = await user_for_access_code(body.school_id, body.password.strip())
+    elif is_school_portal_login and body.school_id:
         # School Management login: SCH account only (User Type Admin in the app).
         # Legacy ADM accounts are accepted only when no SCH row exists.
         school_res = (

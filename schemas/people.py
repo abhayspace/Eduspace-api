@@ -147,6 +147,13 @@ class TeacherMedicalVisitOut(TeacherMedicalVisitIn):
     created_at: Optional[datetime] = None
 
 
+class ChildLinkIn(BaseModel):
+    """Credentials of an additional child a parent links to their account."""
+
+    admission_no: str
+    password: str
+
+
 class StudentMedicalIn(BaseModel):
     """Medical details a student maintains for themselves."""
 
@@ -255,6 +262,7 @@ class StudentUpdateIn(BaseModel):
     email: Optional[str] = None
     address: Optional[str] = None
     transport: Optional[str] = None
+    house: Optional[str] = None
     occupation: Optional[str] = None
     class_id: Optional[str] = None
     section_id: Optional[str] = None
@@ -307,6 +315,14 @@ class StudentUpdateIn(BaseModel):
         return digits
 
 
+class StudentClassFieldsIn(BaseModel):
+    """Fields a class teacher may edit for students in their own class."""
+
+    roll_no: Optional[str] = None
+    house: Optional[str] = None
+    transport: Optional[str] = None
+
+
 class StudentOut(BaseModel):
     id: str
     user_id: str
@@ -322,6 +338,7 @@ class StudentOut(BaseModel):
     alternate_mobile: Optional[str] = None
     address: Optional[str] = None
     transport: Optional[str] = None
+    house: Optional[str] = None
     class_id: Optional[str] = None
     section_id: Optional[str] = None
     class_name: Optional[str] = None

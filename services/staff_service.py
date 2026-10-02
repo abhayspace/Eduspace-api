@@ -1,5 +1,6 @@
 """Non-teaching staff and admin role provisioning."""
 import logging
+import secrets
 from typing import List, Optional
 
 from fastapi import HTTPException, status
@@ -117,7 +118,6 @@ async def create_or_update_admin_role(school_id: str, role: str, body: AdminRole
     client = get_client()
     existing = await get_admin_role(school_id, role)
     email = body.email.lower()
-    credentials: Optional[CredentialsOut] = None
 
     if existing.exists:
         dup = (
@@ -155,7 +155,6 @@ async def create_or_update_admin_role(school_id: str, role: str, body: AdminRole
         raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
 
     user_code = await _next_user_code(school_id, role)
-    temp_password = generate_temp_password()
     user_row = {
         "school_id": school_id,
         "email": email,
@@ -167,16 +166,17 @@ async def create_or_update_admin_role(school_id: str, role: str, body: AdminRole
         "dob": body.dob.isoformat() if body.dob else None,
         "address": body.address,
         "photo_url": body.photo_url,
-        "password_hash": hash_password(temp_password),
-        "must_change_password": True,
+        # Principal/vice-principal are records only — no login account.
+        # Random unshared password so the account can never sign in.
+        "password_hash": hash_password(secrets.token_hex(16)),
+        "must_change_password": False,
         "is_active": True,
     }
     ins = await client.table("users").insert(user_row).execute()
     if not ins.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create user")
-    credentials = CredentialsOut(user_code=user_code, password=temp_password)
     created = await get_admin_role(school_id, role)
-    return created, credentials
+    return created, None
 
 
 async def create_staff(school_id: str, body: StaffCreateIn) -> StaffCreateOut:

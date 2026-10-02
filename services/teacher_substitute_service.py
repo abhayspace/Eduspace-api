@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException, status
 
 from database import get_client
+from services.notification_service import notify_user
 from schemas.content import TeacherScheduleOut, TeacherSubstituteAssignIn
 from services.schedule_days import is_valid_schedule_day
 from services.teacher_schedule_service import get_teacher_schedule
@@ -44,7 +45,7 @@ async def assign_substitute(
 
     teacher_res = (
         await client.table("teachers")
-        .select("id")
+        .select("id,user_id")
         .eq("school_id", school_id)
         .eq("id", body.teacher_id)
         .limit(1)
@@ -55,7 +56,7 @@ async def assign_substitute(
 
     class_res = (
         await client.table("classes")
-        .select("id")
+        .select("id,name")
         .eq("school_id", school_id)
         .eq("id", body.class_id)
         .limit(1)
@@ -66,7 +67,7 @@ async def assign_substitute(
 
     section_res = (
         await client.table("sections")
-        .select("id")
+        .select("id,name")
         .eq("class_id", body.class_id)
         .eq("id", body.section_id)
         .limit(1)
@@ -119,5 +120,66 @@ async def assign_substitute(
     )
     if not inserted.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to assign substitute")
+
+    class_label = class_res.data[0].get("name") or "Class"
+    section_name = section_res.data[0].get("name")
+    if section_name:
+        class_label = f"{class_label} - {section_name}"
+    period_label = f"period {body.period_index + 1}"
+    subject_suffix = f" ({subject_name})" if subject_name else ""
+
+    substitute_user_id = teacher_res.data[0].get("user_id")
+    if substitute_user_id:
+        await notify_user(
+            school_id,
+            substitute_user_id,
+            "Substitute class assigned",
+            f"You are covering {period_label} on {body.day_of_week} for {class_label}{subject_suffix}.",
+        )
+
+    # Notify the regular teacher whose class is being covered.
+    regular_res = (
+        await client.table("class_section_period_assignments")
+        .select("teacher_id")
+        .eq("school_id", school_id)
+        .eq("section_id", body.section_id)
+        .eq("period_index", body.period_index)
+        .eq("day_of_week", body.day_of_week)
+        .neq("teacher_id", body.teacher_id)
+        .execute()
+    )
+    regular_teacher_ids = {
+        row["teacher_id"] for row in (regular_res.data or []) if row.get("teacher_id")
+    }
+    if regular_teacher_ids:
+        regular_user_res = (
+            await client.table("teachers")
+            .select("user_id")
+            .eq("school_id", school_id)
+            .in_("id", list(regular_teacher_ids))
+            .execute()
+        )
+        regular_user_ids = [
+            row["user_id"] for row in (regular_user_res.data or []) if row.get("user_id")
+        ]
+        if regular_user_ids:
+            substitute_name = "A substitute teacher"
+            if substitute_user_id:
+                name_res = (
+                    await client.table("users")
+                    .select("full_name")
+                    .eq("id", substitute_user_id)
+                    .limit(1)
+                    .execute()
+                )
+                if name_res.data and name_res.data[0].get("full_name"):
+                    substitute_name = name_res.data[0]["full_name"]
+            for regular_user_id in regular_user_ids:
+                await notify_user(
+                    school_id,
+                    regular_user_id,
+                    "Substitute teacher assigned",
+                    f"{substitute_name} will cover your {period_label} on {body.day_of_week} for {class_label}{subject_suffix}.",
+                )
 
     return await get_teacher_schedule(school_id, body.teacher_id)

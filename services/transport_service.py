@@ -7,12 +7,14 @@ access; school admins have full CRUD.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+import os
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import HTTPException, status
 
 from database import get_client
+from services.notification_service import _parent_user_ids_for_students, notify_users
 from schemas.transport import (
     MyTransportOut,
     TransportAnalyticsOut,
@@ -35,6 +37,9 @@ from schemas.transport import (
     TransportUpdateOut,
     TransportVehicleCreateIn,
     TransportVehicleOut,
+    TransportVehicleLocationIn,
+    TransportVehicleLocationOut,
+    TransportConfigOut,
     TransportVehicleUpdateIn,
 )
 
@@ -51,7 +56,8 @@ _STAFF_COLS = (
 _VEHICLE_COLS = (
     "id,school_id,vehicle_number,vehicle_type,capacity,driver_staff_id,"
     "attendant_staff_id,route_id,status,maintenance_status,registration_expiry,"
-    "insurance_expiry,notes,is_archived,created_at,updated_at"
+    "insurance_expiry,notes,is_archived,tracking_source,tracker_device_id,"
+    "created_at,updated_at"
 )
 _ROUTE_COLS = (
     "id,school_id,name,route_code,vehicle_id,driver_staff_id,status,pickup_start,"
@@ -304,6 +310,8 @@ def _enrich_vehicle(row: dict, driver_map: dict, attendant_map: dict, route_map:
         insurance_expiry=row.get("insurance_expiry"),
         notes=row.get("notes"),
         is_archived=bool(row.get("is_archived", False)),
+        tracking_source=row.get("tracking_source") or "none",
+        tracker_device_id=row.get("tracker_device_id"),
         assigned_students=assigned,
         available_seats=max(0, cap - assigned),
         created_at=row.get("created_at"),
@@ -1050,6 +1058,22 @@ async def list_requests(
         q = q.eq("status", status)
     res = await q.order("created_at", desc=True).limit(limit).execute()
     rows = res.data or []
+    # Decided requests disappear one week after the decision.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+
+    def _still_visible(r: dict) -> bool:
+        if r.get("status") == "pending":
+            return True
+        ts = r.get("decided_at") or r.get("updated_at") or r.get("created_at")
+        try:
+            decided = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except Exception:  # noqa: BLE001
+            return True
+        if decided.tzinfo is None:
+            decided = decided.replace(tzinfo=timezone.utc)
+        return decided >= cutoff
+
+    rows = [r for r in rows if _still_visible(r)]
     if not rows:
         return []
     student_ids = [r["student_id"] for r in rows if r.get("student_id")]
@@ -1190,6 +1214,13 @@ async def create_update(school_id: str, user: dict, body: TransportUpdateCreateI
     res = await client.table("transport_updates").insert(row).execute()
     if not res.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create update")
+    await _notify_update_passengers(
+        school_id,
+        user,
+        res.data[0].get("route_id"),
+        res.data[0]["title"],
+        res.data[0].get("body") or "",
+    )
     out = await list_updates(school_id, user, limit=1)
     for u in out:
         if u.id == res.data[0]["id"]:
@@ -1206,6 +1237,50 @@ async def create_update(school_id: str, user: dict, body: TransportUpdateCreateI
         created_by_name=user_map.get(user["id"], ""),
         created_at=res.data[0].get("created_at"),
     )
+
+
+async def _notify_update_passengers(
+    school_id: str,
+    user: dict,
+    route_id: Optional[str],
+    title: str,
+    body: str,
+) -> None:
+    """Push a transport update to the students riding that route and their
+    parents. A school-wide update (no route) reaches every active transport
+    assignment. Best-effort — never blocks the update creation."""
+    try:
+        client = get_client()
+        query = (
+            client.table("transport_assignments")
+            .select("student_id")
+            .eq("school_id", school_id)
+            .eq("status", "active")
+        )
+        if route_id:
+            query = query.eq("route_id", route_id)
+        res = await query.execute()
+        profile_ids = list({r["student_id"] for r in (res.data or []) if r.get("student_id")})
+        if not profile_ids:
+            return
+        sres = (
+            await client.table("students")
+            .select("user_id")
+            .eq("school_id", school_id)
+            .in_("id", profile_ids)
+            .execute()
+        )
+        student_user_ids = [r["user_id"] for r in (sres.data or []) if r.get("user_id")]
+        parent_user_ids = await _parent_user_ids_for_students(school_id, profile_ids)
+        await notify_users(
+            school_id,
+            student_user_ids + parent_user_ids,
+            f"Transport: {title}",
+            body or title,
+            exclude_user_id=user["id"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("transport update notify failed (non-blocking): %s", exc)
 
 
 async def delete_update(school_id: str, update_id: str, user: dict) -> None:
@@ -1270,3 +1345,211 @@ async def get_my_transport(school_id: str, user: dict) -> MyTransportOut:
         vehicle=vehicle,
         driver_name=driver_name,
     )
+
+
+# ---------------------------------------------------------------------------
+# Live vehicle tracking
+# ---------------------------------------------------------------------------
+_DEFAULT_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+_DEFAULT_TILE_ATTRIBUTION = "© OpenStreetMap contributors"
+
+
+async def get_map_config() -> TransportConfigOut:
+    """Map tile provider for the live bus map — configurable via env."""
+    return TransportConfigOut(
+        map_tile_url=os.getenv("MAP_TILE_URL", _DEFAULT_TILE_URL),
+        map_attribution=os.getenv("MAP_TILE_ATTRIBUTION", _DEFAULT_TILE_ATTRIBUTION),
+    )
+
+
+async def _vehicle_row(school_id: str, vehicle_id: str) -> Optional[dict]:
+    client = get_client()
+    res = (
+        await client.table("transport_vehicles")
+        .select("id,vehicle_number,tracking_source,tracker_device_id")
+        .eq("school_id", school_id)
+        .eq("id", vehicle_id)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def _location_out(vehicle_id: str, row: dict) -> TransportVehicleLocationOut:
+    return TransportVehicleLocationOut(
+        vehicle_id=vehicle_id,
+        latitude=row["latitude"],
+        longitude=row["longitude"],
+        speed=row.get("speed"),
+        heading=row.get("heading"),
+        source=row.get("source") or "phone",
+        recorded_at=row.get("recorded_at"),
+    )
+
+
+async def _stored_location(school_id: str, vehicle_id: str) -> Optional[TransportVehicleLocationOut]:
+    res = (
+        await get_client()
+        .table("transport_vehicle_locations")
+        .select("*")
+        .eq("school_id", school_id)
+        .eq("vehicle_id", vehicle_id)
+        .limit(1)
+        .execute()
+    )
+    return _location_out(vehicle_id, res.data[0]) if res.data else None
+
+
+async def _fetch_traccar_position(device_id: str) -> Optional[dict]:
+    """Latest position for a Traccar device. Returns None when unconfigured/unreachable."""
+    base = os.getenv("TRACCAR_BASE_URL", "").rstrip("/")
+    if not base or not device_id:
+        return None
+    token = os.getenv("TRACCAR_TOKEN", "")
+    try:
+        import httpx
+
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        async with httpx.AsyncClient(timeout=8) as http:
+            resp = await http.get(f"{base}/api/positions", params={"deviceId": device_id}, headers=headers)
+        if resp.status_code != 200:
+            return None
+        positions = resp.json()
+        if not positions:
+            return None
+        latest = max(positions, key=lambda p: p.get("fixTime") or "")
+        return {
+            "latitude": latest["latitude"],
+            "longitude": latest["longitude"],
+            "speed": latest.get("speed"),
+            "heading": latest.get("course"),
+            "recorded_at": latest.get("fixTime"),
+            "source": "traccar",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("traccar fetch failed for device %s: %s", device_id, exc)
+        return None
+
+
+async def _live_location(school_id: str, vehicle: dict) -> Optional[TransportVehicleLocationOut]:
+    """Resolve the freshest location for a vehicle from its configured source."""
+    vehicle_id = vehicle["id"]
+    if vehicle.get("tracking_source") == "traccar":
+        pos = await _fetch_traccar_position(vehicle.get("tracker_device_id"))
+        if pos:
+            pos["vehicle_id"] = vehicle_id
+            # Cache it so parents/admins still see the last known fix when
+            # the tracker is briefly offline.
+            try:
+                await (
+                    get_client()
+                    .table("transport_vehicle_locations")
+                    .upsert(
+                        {
+                            "school_id": school_id,
+                            "vehicle_id": vehicle_id,
+                            "latitude": pos["latitude"],
+                            "longitude": pos["longitude"],
+                            "speed": pos.get("speed"),
+                            "heading": pos.get("heading"),
+                            "source": "traccar",
+                            "recorded_at": pos.get("recorded_at") or datetime.now(timezone.utc).isoformat(),
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        on_conflict="vehicle_id",
+                    )
+                    .execute()
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("location cache upsert failed: %s", exc)
+            return _location_out(vehicle_id, pos)
+    return await _stored_location(school_id, vehicle_id)
+
+
+async def report_vehicle_location(
+    school_id: str, vehicle_id: str, user: dict, body: TransportVehicleLocationIn
+) -> TransportVehicleLocationOut:
+    """Driver/manager phone pushes the vehicle's GPS fix."""
+    if not _is_manager(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient permissions")
+    vehicle = await _vehicle_row(school_id, vehicle_id)
+    if not vehicle:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Vehicle not found")
+    now = datetime.now(timezone.utc).isoformat()
+    row = {
+        "school_id": school_id,
+        "vehicle_id": vehicle_id,
+        "latitude": body.latitude,
+        "longitude": body.longitude,
+        "speed": body.speed,
+        "heading": body.heading,
+        "source": "phone",
+        "recorded_at": (body.recorded_at.isoformat() if body.recorded_at else now),
+        "updated_by_user_id": user["id"],
+        "updated_at": now,
+    }
+    res = (
+        await get_client()
+        .table("transport_vehicle_locations")
+        .upsert(row, on_conflict="vehicle_id")
+        .execute()
+    )
+    data = res.data[0] if res.data else row
+    return _location_out(vehicle_id, data)
+
+
+async def get_vehicle_location(
+    school_id: str, vehicle_id: str, user: dict
+) -> TransportVehicleLocationOut:
+    if not _is_manager(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient permissions")
+    vehicle = await _vehicle_row(school_id, vehicle_id)
+    if not vehicle:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Vehicle not found")
+    loc = await _live_location(school_id, vehicle)
+    if not loc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No location reported for this vehicle yet")
+    return loc
+
+
+async def get_my_transport_location(
+    school_id: str, user: dict
+) -> TransportVehicleLocationOut:
+    """Student/parent → live location of the vehicle they ride."""
+    if not _is_student_or_parent(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only students and parents can access this endpoint")
+    student_id = await _resolve_student_id(school_id, user)
+    if not student_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No linked student found")
+    ares = (
+        await get_client()
+        .table("transport_assignments")
+        .select("vehicle_id,route_id")
+        .eq("school_id", school_id)
+        .eq("student_id", student_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    vehicle_id = (ares.data[0].get("vehicle_id") if ares.data else None)
+    if not vehicle_id and ares.data and ares.data[0].get("route_id"):
+        # Fall back to the vehicle assigned to the student's route.
+        rres = (
+            await get_client()
+            .table("transport_routes")
+            .select("vehicle_id")
+            .eq("school_id", school_id)
+            .eq("id", ares.data[0]["route_id"])
+            .limit(1)
+            .execute()
+        )
+        vehicle_id = rres.data[0].get("vehicle_id") if rres.data else None
+    if not vehicle_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No vehicle assigned")
+    vehicle = await _vehicle_row(school_id, vehicle_id)
+    if not vehicle:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Vehicle not found")
+    loc = await _live_location(school_id, vehicle)
+    if not loc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Bus location is not available yet")
+    return loc

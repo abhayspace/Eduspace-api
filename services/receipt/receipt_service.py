@@ -441,6 +441,95 @@ async def ensure_receipt_after_paid(
         return None
 
 
+async def create_custom_receipt(
+    user: dict,
+    *,
+    student_name: str,
+    amount: float,
+    student_id: Optional[str] = None,
+    note: Optional[str] = None,
+    lines: Optional[list[dict[str, Any]]] = None,
+    payment_method: Optional[str] = None,
+) -> dict[str, Any]:
+    """Ad-hoc school-branded receipt not tied to a payment record."""
+    school_id = user.get("school_id")
+    if not school_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "No school scope")
+    name = (student_name or "").strip()
+    if not name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Enter a payer / student name")
+    if amount <= 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Enter a valid amount")
+
+    # If a real student was selected, pull their details into the snapshot.
+    student: dict[str, Any] = {"full_name": name}
+    if student_id:
+        loaded = await _load_student(
+            school_id, student_id=student_id, student_email=None
+        )
+        if loaded:
+            student = {**loaded, "full_name": loaded.get("full_name") or name}
+
+    school = await _load_school(school_id)
+    generated_at = _now()
+    receipt_number = await next_receipt_number(school_id, school)
+    payment = {
+        "payment_status": "paid",
+        "payment_method": (payment_method or "cash").strip() or "cash",
+        "gateway_name": "office",
+        "payment_date": generated_at,
+        "currency": "INR",
+        "amount": float(amount),
+        "total": float(amount),
+        "discount": 0,
+        "tax": 0,
+        "fine": 0,
+    }
+    fee_lines = [
+        {"title": str(l.get("title") or "Fee").strip() or "Fee", "amount": float(l.get("amount") or 0)}
+        for l in (lines or [])
+        if float(l.get("amount") or 0) > 0
+    ]
+    if not fee_lines:
+        fee_lines = [
+            {"title": (note or "").strip() or "Fee Payment", "amount": float(amount)}
+        ]
+    snapshot = _build_snapshot(
+        school=school,
+        student=student,
+        payment=payment,
+        receipt_number=receipt_number,
+        fee_lines=fee_lines,
+        generated_at=generated_at,
+    )
+
+    pdf_bytes = generate_receipt_pdf(snapshot)
+    pdf_path, pdf_url = default_storage.save_pdf(
+        year=_year_from_iso(generated_at),
+        receipt_number=receipt_number,
+        content=pdf_bytes,
+    )
+
+    client = get_client()
+    row_payload = {
+        "receipt_number": receipt_number,
+        "school_id": school_id,
+        "student_id": student.get("id") or student_id,
+        "pdf_path": pdf_path,
+        "pdf_url": pdf_url,
+        "snapshot": snapshot,
+        "generated_at": generated_at,
+        "generated_by": "office",
+        "created_at": generated_at,
+    }
+    inserted = await client.table("fee_receipts").insert(row_payload).execute()
+    if not inserted.data:
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to store receipt record"
+        )
+    return _row_to_out(inserted.data[0])
+
+
 async def list_student_receipts(user: dict) -> list[dict[str, Any]]:
     if user.get("role") != "student":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Students only")

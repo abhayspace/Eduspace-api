@@ -72,8 +72,7 @@ async def _maybe_purge_messages(school_id: str) -> None:
 
 CHAT_PEER_ROLES = (
     # School Management (SCH/ADM school_admin) is not a chat profile — cannot be messaged.
-    "principal",
-    "vice_principal",
+    # Principal/vice-principal are records only (no login accounts) — not chat peers.
     "teacher",
     "receptionist",
     "accountant",
@@ -458,7 +457,55 @@ async def _assert_group_access(school_id: str, group_id: str, user: dict) -> Non
             return
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this group")
 
+    if role == "parent":
+        pairs = await _parent_child_pairs(school_id, user["id"])
+        if (class_id, section_id) in pairs:
+            return
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this group")
+
     raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this group")
+
+
+async def _parent_child_pairs(school_id: str, parent_user_id: str) -> set:
+    """{(class_id, section_id)} for every student linked to this parent."""
+    client = get_client()
+    links = (
+        await client.table("parents")
+        .select("student_id")
+        .eq("school_id", school_id)
+        .eq("user_id", parent_user_id)
+        .execute()
+    )
+    student_ids = [r["student_id"] for r in (links.data or []) if r.get("student_id")]
+    if not student_ids:
+        return set()
+    res = (
+        await client.table("students")
+        .select("class_id,section_id")
+        .eq("school_id", school_id)
+        .in_("id", student_ids)
+        .execute()
+    )
+    return {
+        (r.get("class_id"), r.get("section_id"))
+        for r in (res.data or [])
+        if r.get("class_id") and r.get("section_id")
+    }
+
+
+async def _parent_chat_enabled(school_id: str) -> bool:
+    """School setting: whether parents may start chats with teachers."""
+    client = get_client()
+    res = (
+        await client.table("schools")
+        .select("allow_parent_teacher_chat")
+        .eq("id", school_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        return False
+    return bool(res.data[0].get("allow_parent_teacher_chat") or False)
 
 
 async def _group_membership_ctx(school_id: str, user: dict):
@@ -471,6 +518,9 @@ async def _group_membership_ctx(school_id: str, user: dict):
     if role in {"school_admin", "principal", "vice_principal", "super_admin", "office_staff"}:
         return "all", None
     client = get_client()
+    if role == "parent":
+        pairs = await _parent_child_pairs(school_id, user["id"])
+        return "student", pairs
     if role == "teacher":
         res = (
             await client.table("teachers")
@@ -642,15 +692,17 @@ async def _assert_peer(school_id: str, peer_user_id: str, user: dict) -> dict:
 
     # Teachers/staff may message School Management (routed to canonical SCH). Students cannot.
     if _is_school_portal_account(role, peer.get("user_code")):
-        if my_role == "student":
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Students cannot message School Management")
+        if my_role in {"student", "parent"}:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Students and parents cannot message School Management")
         canonical = await _canonical_school_portal_user(school_id)
         if not canonical:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "School Management not found")
         if canonical["id"] in self_ids:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot message yourself")
         return canonical
-    if role not in CHAT_PEER_ROLES:
+    # "parent" is allowed so teachers/staff can reply to parent-initiated threads;
+    # parents are still not listed as new-chat contacts for those roles.
+    if role not in CHAT_PEER_ROLES and role != "parent":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot message this person")
 
     # Role-based restrictions
@@ -704,6 +756,59 @@ async def _assert_peer(school_id: str, peer_user_id: str, user: dict) -> dict:
             if t_cls == stu_cls_name and (t_sec == "all sections" or t_sec == stu_sec_name):
                 return peer
         raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only message students you teach")
+
+    if my_role == "parent":
+        # Parents can only message teachers who teach their linked children,
+        # and only when the school enables parent-teacher chat.
+        if role != "teacher":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Parents can only message teachers")
+        if not await _parent_chat_enabled(school_id):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Parent-teacher chat is disabled by the school")
+        pairs = await _parent_child_pairs(school_id, user["id"])
+        if not pairs:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "No linked children found")
+        t_profile = (
+            await client.table("teachers")
+            .select("classes_teaching,class_teacher_class_id,class_teacher_section_id")
+            .eq("user_id", peer_user_id)
+            .limit(1)
+            .execute()
+        )
+        if not t_profile.data:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only message your children's teachers")
+        t_data = t_profile.data[0]
+        cls_res = (
+            await client.table("classes")
+            .select("id,name")
+            .in_("id", [c for c, _ in pairs])
+            .execute()
+        )
+        sec_res = (
+            await client.table("sections")
+            .select("id,name")
+            .in_("id", [s for _, s in pairs])
+            .execute()
+        )
+        cls_names = {r["id"]: (r.get("name") or "").strip().lower() for r in cls_res.data or []}
+        sec_names = {r["id"]: (r.get("name") or "").strip().lower() for r in sec_res.data or []}
+        assignments = t_data.get("classes_teaching") or []
+        for cls_id, sec_id in pairs:
+            if (
+                t_data.get("class_teacher_class_id") == cls_id
+                and t_data.get("class_teacher_section_id") == sec_id
+            ):
+                return peer
+            cn = cls_names.get(cls_id, "")
+            sn = sec_names.get(sec_id, "")
+            for entry in assignments:
+                parts = entry.split(" - ")
+                if len(parts) < 2:
+                    continue
+                t_cls = parts[0].strip().lower()
+                t_sec = parts[1].strip().lower()
+                if t_cls == cn and (t_sec == "all sections" or t_sec == sn):
+                    return peer
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You can only message your children's teachers")
 
     # Students: can only message teachers who teach them (no student-to-student)
     if role == "student":
@@ -888,6 +993,70 @@ async def list_chat_peers(user: dict = Depends(current_user)) -> List[ChatPeerOu
                 if row["id"] not in me_ids and not any(p["id"] == row["id"] for p in peers):
                     peers.append(row)
 
+    elif my_role == "parent":
+        # Parents: only teachers who teach their linked children (when the school allows it).
+        peers = []
+        if await _parent_chat_enabled(user["school_id"]):
+            pairs = await _parent_child_pairs(user["school_id"], user["id"])
+            if pairs:
+                cls_res = (
+                    await client.table("classes")
+                    .select("id,name")
+                    .in_("id", [c for c, _ in pairs])
+                    .execute()
+                )
+                sec_res = (
+                    await client.table("sections")
+                    .select("id,name")
+                    .in_("id", [s for _, s in pairs])
+                    .execute()
+                )
+                cls_names = {r["id"]: (r.get("name") or "").strip().lower() for r in cls_res.data or []}
+                sec_names = {r["id"]: (r.get("name") or "").strip().lower() for r in sec_res.data or []}
+                all_teachers = (
+                    await client.table("teachers")
+                    .select("user_id,classes_teaching,class_teacher_class_id,class_teacher_section_id")
+                    .eq("school_id", user["school_id"])
+                    .execute()
+                )
+                teacher_user_ids: Set[str] = set()
+                for t in (all_teachers.data or []):
+                    t_uid = t.get("user_id")
+                    if not t_uid:
+                        continue
+                    assignments = t.get("classes_teaching") or []
+                    for cls_id, sec_id in pairs:
+                        if (
+                            t.get("class_teacher_class_id") == cls_id
+                            and t.get("class_teacher_section_id") == sec_id
+                        ):
+                            teacher_user_ids.add(t_uid)
+                            break
+                        cn = cls_names.get(cls_id, "")
+                        sn = sec_names.get(sec_id, "")
+                        for entry in assignments:
+                            parts = entry.split(" - ")
+                            if len(parts) < 2:
+                                continue
+                            t_cls = parts[0].strip().lower()
+                            t_sec = parts[1].strip().lower()
+                            if t_cls == cn and (t_sec == "all sections" or t_sec == sn):
+                                teacher_user_ids.add(t_uid)
+                                break
+                        if t_uid in teacher_user_ids:
+                            break
+                if teacher_user_ids:
+                    t_users = (
+                        await client.table("users")
+                        .select("id,full_name,role,user_code,gender")
+                        .eq("school_id", user["school_id"])
+                        .eq("is_active", True)
+                        .in_("id", list(teacher_user_ids))
+                        .order("full_name")
+                        .execute()
+                    )
+                    peers = [row for row in (t_users.data or []) if row["id"] not in me_ids]
+
     else:
         # Student (and any other non-admin, non-teacher role): only school + teachers who teach them
         my_stu = (
@@ -971,8 +1140,11 @@ async def list_chat_peers(user: dict = Depends(current_user)) -> List[ChatPeerOu
         for row in peers
     ]
 
-    # Teachers/staff can start (or reopen) a chat with School Management (students cannot).
-    if not _is_school_portal_account(user.get("role"), user.get("user_code")) and my_role != "student":
+    # Teachers/staff can start (or reopen) a chat with School Management (students/parents cannot).
+    if (
+        not _is_school_portal_account(user.get("role"), user.get("user_code"))
+        and my_role not in {"student", "parent"}
+    ):
         canonical = await _canonical_school_portal_user(user["school_id"])
         if canonical and canonical["id"] not in me_ids:
             out.insert(
@@ -1390,6 +1562,8 @@ async def reupload_video(
 async def post_message(body: ChatSendIn, user: dict = Depends(current_user)) -> ChatMessage:
     dm_recipient_id, group_id = _split_recipient(body.recipient_id)
     if group_id:
+        if (user.get("role") or "") == "parent":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Parents cannot post in class groups")
         await _assert_group_access(user["school_id"], group_id, user)
     elif dm_recipient_id:
         peer = await _assert_peer(user["school_id"], dm_recipient_id, user)

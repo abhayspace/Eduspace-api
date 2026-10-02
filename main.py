@@ -57,6 +57,7 @@ from routers import (
     support,
     syllabus,
     teachers,
+    team,
     timetable,
     transport,
 )
@@ -98,6 +99,7 @@ ROUTERS = [
     schools.router,
     support.router,
     dev_message.router,
+    team.router,
     student_settings.router,
     students.router,
     teachers.router,

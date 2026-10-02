@@ -5,6 +5,7 @@ from typing import List, Optional
 from fastapi import HTTPException, status
 
 from database import get_client
+from services.notification_service import notify_school_roles
 from schemas.form import (
     FormDetailOut,
     FormListItemOut,
@@ -66,7 +67,7 @@ async def upsert_form(school_id: str, user_id: str, body: FormUpsertIn) -> FormD
     }
     existing = (
         await client.table(FORMS)
-        .select("id,created_by_user_id")
+        .select("id,created_by_user_id,status")
         .eq("school_id", school_id)
         .eq("id", body.id)
         .limit(1)
@@ -82,6 +83,17 @@ async def upsert_form(school_id: str, user_id: str, body: FormUpsertIn) -> FormD
         res = await client.table(FORMS).insert(payload).execute()
     if not res.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to save form")
+
+    # Notify students+parents only the first time a form becomes published.
+    was_published = bool(existing.data) and existing.data[0].get("status") == "published"
+    if body.status == "published" and not was_published:
+        await notify_school_roles(
+            school_id,
+            ["student", "parent"],
+            f"New form: {body.title}",
+            (body.description or "Please open the app and fill it out.")[:280],
+            exclude_user_id=user_id,
+        )
     return _detail(res.data[0])
 
 

@@ -5,6 +5,7 @@ from typing import List
 from fastapi import HTTPException, status
 
 from database import get_client
+from services.notification_service import notify_school_roles, notify_user
 from schemas.appointments import (
     AppointmentCancelIn,
     AppointmentDecisionIn,
@@ -108,6 +109,15 @@ async def create_appointment(school_id: str, user: dict, body: AppointmentIn) ->
     )
     if not res.data:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to create appointment request")
+
+    await notify_school_roles(
+        school_id,
+        ["school_admin", "super_admin"],
+        f"New meeting request: {body.title.strip()}",
+        f"{user.get('full_name') or 'A user'} requested a meeting on {body.appointment_date.isoformat()} {body.appointment_time.strip()}.",
+        exclude_user_id=user["id"],
+    )
+
     return _out(res.data[0])
 
 
@@ -165,6 +175,13 @@ async def decide_appointment(
         )
         .eq("id", request_id)
         .execute()
+    )
+    decision = body.status.replace("_", " ").title()
+    await notify_user(
+        school_id,
+        row["user_id"],
+        f"Meeting request {decision.lower()}",
+        f"Your request \"{row.get('title') or 'Meeting'}\" for {row.get('appointment_date')} was {body.status}.",
     )
     if res.data:
         return _out(res.data[0])

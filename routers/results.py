@@ -1039,21 +1039,65 @@ def _demo_my_performance(exam_name: str, student_email: str) -> dict:
     }
 
 
+async def _my_performance_student_email(user: dict, student_id: Optional[str]) -> str:
+    """Resolve which student's results to read.
+
+    Students always read their own. Parents pass a linked child's ``student_id``
+    (students.id); when omitted, the first linked child is used.
+    """
+    if user.get("role") != "parent":
+        return user["email"]
+    client = get_client()
+    link_query = (
+        client.table("parents")
+        .select("student_id")
+        .eq("school_id", user["school_id"])
+        .eq("user_id", user["id"])
+    )
+    if student_id:
+        link_query = link_query.eq("student_id", student_id)
+    link = await link_query.limit(1).execute()
+    if not link.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Child not linked to this parent")
+    profile = (
+        await client.table("students")
+        .select("user_id")
+        .eq("id", link.data[0]["student_id"])
+        .limit(1)
+        .execute()
+    )
+    if not profile.data:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+    student_user = (
+        await client.table("users")
+        .select("email")
+        .eq("id", profile.data[0]["user_id"])
+        .limit(1)
+        .execute()
+    )
+    email = ((student_user.data or [{}])[0].get("email") or "").strip()
+    if not email:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+    return email
+
+
 @router.get("/my-performance/options")
 async def my_performance_options(
-    user: dict = Depends(require_roles("student")),
+    student_id: Optional[str] = Query(None),
+    user: dict = Depends(require_roles("student", "parent")),
 ) -> dict:
-    """Exams the logged-in student has results for."""
+    """Exams the logged-in student (or parent's linked child) has results for."""
     client = get_client()
     school_id = user["school_id"]
     if await _is_demo_performance_school(school_id):
         return _demo_my_performance_options()
 
+    student_email = await _my_performance_student_email(user, student_id)
     results = (
         await client.table("results")
         .select("examination_id")
         .eq("school_id", school_id)
-        .eq("student_email", user["email"])
+        .eq("student_email", student_email)
         .limit(1000)
         .execute()
     )
@@ -1091,14 +1135,16 @@ async def my_performance_options(
 @router.get("/my-performance")
 async def my_performance(
     exam_name: str = Query(...),
-    user: dict = Depends(require_roles("student")),
+    student_id: Optional[str] = Query(None),
+    user: dict = Depends(require_roles("student", "parent")),
 ) -> dict:
-    """Subject-wise performance for the logged-in student in one exam."""
+    """Subject-wise performance for the logged-in student (or linked child) in one exam."""
     client = get_client()
     school_id = user["school_id"]
     exam_key = exam_name.strip()
+    student_email = await _my_performance_student_email(user, student_id)
     if await _is_demo_performance_school(school_id):
-        return _demo_my_performance(exam_key, user["email"])
+        return _demo_my_performance(exam_key, student_email)
 
     empty = {
         "exam_name": exam_key,
@@ -1133,7 +1179,7 @@ async def my_performance(
         await client.table("results")
         .select(_COLUMNS)
         .eq("school_id", school_id)
-        .eq("student_email", user["email"])
+        .eq("student_email", student_email)
         .in_("examination_id", exam_ids)
         .limit(200)
         .execute()

@@ -13,6 +13,8 @@ from schemas.content import (
     FeeTransactionOut,
     StudentFeeDueIn,
     StudentFeeMarkPaidIn,
+    FeeReminderIn,
+    FeeChargeIn,
 )
 from schemas.student_fees import (
     FeeDiscountIn,
@@ -64,10 +66,13 @@ async def _mark_fee_rows_paid(
     rows: list,
     now: str,
     custom_amount: Optional[float] = None,
+    settle_amount: Optional[float] = None,
     student_id: Optional[str] = None,
     student_email: Optional[str] = None,
 ) -> dict:
     """Mark pending fee rows paid. If custom_amount is set, apply FIFO partial payment.
+    If settle_amount is set, all rows are still marked paid but the ledger records
+    the settled amount (the difference is logged as a discount).
 
     Also creates a ``fee_payments`` ledger row and generates a PDF receipt so the
     payment appears in Recent fees transactions with download/print.
@@ -81,6 +86,17 @@ async def _mark_fee_rows_paid(
     method = "custom" if custom_amount is not None else "office"
     paid_fee_ids: list[str] = []
 
+    total_due = sum(float(row.get("amount") or 0) for row in rows)
+    settle_scale = (
+        float(settle_amount) / total_due
+        if settle_amount is not None and total_due > 0
+        else None
+    )
+    discount_total = round(total_due - float(settle_amount or 0), 2) if settle_scale else 0.0
+
+    payable_rows = [row for row in rows if float(row.get("amount") or 0) > 0]
+    last_payable_id = payable_rows[-1]["id"] if payable_rows else None
+
     for row in rows:
         fee_amount = float(row.get("amount") or 0)
         if fee_amount <= 0:
@@ -89,6 +105,12 @@ async def _mark_fee_rows_paid(
             if remaining <= 0:
                 break
             pay_amount = min(fee_amount, remaining)
+        elif settle_scale is not None:
+            # Pro-rata the settled amount across dues; last row absorbs rounding drift.
+            if row["id"] == last_payable_id:
+                pay_amount = max(0.0, round(float(settle_amount) - paid_total, 2))
+            else:
+                pay_amount = round(fee_amount * settle_scale, 2)
         else:
             pay_amount = fee_amount
 
@@ -156,9 +178,9 @@ async def _mark_fee_rows_paid(
             "invoice_number": invoice,
             "amount": round(paid_total, 2),
             "tax": 0,
-            "discount": 0,
             "fine": 0,
             "total": round(paid_total, 2),
+            "discount": discount_total if discount_total > 0 else 0,
             "currency": "INR",
             "gateway_name": "office",
             "payment_status": "paid",
@@ -594,8 +616,9 @@ async def set_class_fee(
     body: FeeAmountIn,
     user: dict = Depends(_FEE_ADMIN),
 ) -> FeeStructureClassOut:
+    items = [i.model_dump() for i in body.items] if body.items else None
     return await fee_structure_service.set_class_monthly_amount(
-        user["school_id"], class_id, body.amount
+        user["school_id"], class_id, body.amount, items
     )
 
 
@@ -605,8 +628,9 @@ async def set_section_fee(
     body: FeeAmountIn,
     user: dict = Depends(_FEE_ADMIN),
 ) -> FeeStructureSectionOut:
+    items = [i.model_dump() for i in body.items] if body.items else None
     return await fee_structure_service.set_section_monthly_amount(
-        user["school_id"], section_id, body.amount
+        user["school_id"], section_id, body.amount, items
     )
 
 
@@ -794,6 +818,7 @@ async def mark_student_fees_paid(
             now=now,
             student_id=student.id,
             student_email=email,
+            settle_amount=float(body.amount) if body.amount is not None else None,
         )
 
     result["mode"] = mode
@@ -888,6 +913,110 @@ async def delete_fee_discount(
 ) -> Response:
     await student_fees_service.delete_fee_discount(user["school_id"], discount_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Custom class charges (annual fee, caution money, …) applied in a month
+# ---------------------------------------------------------------------------
+
+
+@router.get("/charges")
+async def list_class_charges(
+    user: dict = Depends(_FEE_ADMIN),
+    class_id: Optional[str] = Query(default=None),
+) -> List[dict]:
+    return await fee_structure_service.list_class_charges(user["school_id"], class_id)
+
+
+@router.post("/charges")
+async def add_class_charge(
+    body: FeeChargeIn,
+    user: dict = Depends(_FEE_ADMIN),
+) -> List[dict]:
+    return await fee_structure_service.add_class_charges(
+        user["school_id"], body.class_ids, body.title, body.amount, body.apply_months
+    )
+
+
+@router.delete("/charges/{charge_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_class_charge(
+    charge_id: str,
+    user: dict = Depends(_FEE_ADMIN),
+) -> Response:
+    await fee_structure_service.delete_class_charge(user["school_id"], charge_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Fee reminders — push + in-app notifications to students and parents
+# ---------------------------------------------------------------------------
+
+
+@router.post("/reminder")
+async def send_fee_reminder(
+    body: FeeReminderIn,
+    user: dict = Depends(_FEE_ADMIN),
+) -> dict:
+    from services import notification_service
+
+    school_id = user["school_id"]
+    message = (body.message or "").strip()
+    if len(message) < 3:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Enter a reminder message")
+    title = (body.title or "").strip() or "Fee Reminder"
+
+    client = get_client()
+
+    if body.scope == "unpaid":
+        fees_res = (
+            await client.table("fees")
+            .select("student_email")
+            .eq("school_id", school_id)
+            .eq("status", "pending")
+            .limit(5000)
+            .execute()
+        )
+        emails = {
+            (r.get("student_email") or "").strip().lower()
+            for r in (fees_res.data or [])
+        }
+        emails.discard("")
+        if not emails:
+            return {"ok": True, "notified": 0}
+
+        # Map pending-fee emails to student profiles (case-insensitive).
+        stud_res = (
+            await client.table("students")
+            .select("id,user_id,email")
+            .eq("school_id", school_id)
+            .limit(5000)
+            .execute()
+        )
+        profiles = [
+            p
+            for p in (stud_res.data or [])
+            if (p.get("email") or "").strip().lower() in emails
+        ]
+        user_ids = [p["user_id"] for p in profiles if p.get("user_id")]
+        profile_ids = [p["id"] for p in profiles if p.get("id")]
+        parent_ids = await notification_service._parent_user_ids_for_students(
+            school_id, profile_ids
+        )
+        targets = list(dict.fromkeys([*user_ids, *parent_ids]))
+        await notification_service.notify_users(school_id, targets, title, message)
+        return {"ok": True, "notified": len(targets)}
+
+    users_res = (
+        await client.table("users")
+        .select("id")
+        .eq("school_id", school_id)
+        .eq("is_active", True)
+        .in_("role", ["student", "parent"])
+        .execute()
+    )
+    ids = [r["id"] for r in users_res.data or []]
+    await notification_service.notify_users(school_id, ids, title, message)
+    return {"ok": True, "notified": len(ids)}
 
 
 # ---------------------------------------------------------------------------
